@@ -36,7 +36,7 @@ import org.slf4j.LoggerFactory
 private val log = LoggerFactory.getLogger("jhmcp.Main")
 private val json = Json { prettyPrint = false; encodeDefaults = true }
 
-private data class Config(val apkPath: String, val maxSourceBytes: Int)
+private data class Config(val apkPath: String?, val maxSourceBytes: Int)
 
 private fun parseArgs(args: Array<String>): Config {
     var apkPath: String? = null
@@ -64,18 +64,18 @@ private fun parseArgs(args: Array<String>): Config {
             }
         }
     }
-    require(apkPath != null) { "--apk <path> is required\n$USAGE" }
     return Config(apkPath, maxSourceBytes)
 }
 
 private const val USAGE = """
-Usage: jadx-headless-mcp --apk <path> [--max-source-bytes N]
+Usage: jadx-headless-mcp [--apk <path>] [--max-source-bytes N]
 
 Headless JADX-based MCP server for Android APK static analysis.
 Communicates via MCP over stdio.
 
 Options:
-  --apk <path>              path to APK / DEX / JAR (required)
+  --apk <path>              optional: APK / DEX / JAR to load eagerly at startup.
+                            If omitted, use the 'load_apk' tool to load on demand.
   --max-source-bytes <n>    max bytes per source response (default 200000)
   -h, --help                show this help
 """
@@ -88,18 +88,24 @@ fun main(args: Array<String>) {
     System.setOut(System.err)
 
     val cfg = parseArgs(args)
-    val session = JadxSession.open(cfg.apkPath, cfg.maxSourceBytes)
-    Runtime.getRuntime().addShutdownHook(Thread { runCatching { session.close() } })
+    val holder = SessionHolder(cfg.maxSourceBytes)
+    Runtime.getRuntime().addShutdownHook(Thread {
+        runCatching { runBlocking { holder.unload() } }
+    })
 
     val server = Server(
-        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.1.0"),
+        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.2.0"),
         options = ServerOptions(
             capabilities = ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = null))
         )
     )
-    registerTools(server, session)
+    registerTools(server, holder)
 
     runBlocking {
+        if (cfg.apkPath != null) {
+            runCatching { holder.load(cfg.apkPath) }
+                .onFailure { System.err.println("[jhmcp] eager load failed: ${it.message}") }
+        }
         val transport = StdioServerTransport(
             System.`in`.asSource().buffered(),
             realOut.asSink().buffered()
@@ -113,12 +119,66 @@ fun main(args: Array<String>) {
 
 // ─── tool registration ──────────────────────────────────────────────────────
 
-private fun registerTools(server: Server, s: JadxSession) {
+private fun registerTools(server: Server, holder: SessionHolder) {
+    server.addTool(
+        name = "status",
+        description = "Report whether an APK is loaded and basic info (path, class count, resource count, load duration).",
+        inputSchema = ToolSchema(properties = buildJsonObject {})
+    ) { _: CallToolRequest ->
+        val snap = holder.snapshot()
+        okJson(buildJsonObject {
+            put("state", snap.state)
+            snap.apkPath?.let { put("apk_path", it) }
+            snap.classCount?.let { put("class_count", it) }
+            snap.resourceCount?.let { put("resource_count", it) }
+            snap.loadDurationMs?.let { put("load_duration_ms", it) }
+            snap.loadedAtEpochMs?.let { put("loaded_at_epoch_ms", it) }
+        })
+    }
+
+    server.addTool(
+        name = "load_apk",
+        description = "Load an APK / DEX / JAR. Replaces any currently-loaded file. Blocks until indexing completes (typically a few seconds to a minute depending on size).",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("path") { put("type", "string"); put("description", "Absolute path to the APK / DEX / JAR.") }
+            },
+            required = listOf("path")
+        )
+    ) { req: CallToolRequest ->
+        val path = req.arguments.strArg("path") ?: return@addTool errorResult("path is required")
+        runCatching { holder.load(path) }.fold(
+            onSuccess = { r ->
+                okJson(buildJsonObject {
+                    put("state", "LOADED")
+                    put("apk_path", r.apkPath)
+                    put("class_count", r.classCount)
+                    put("resource_count", r.resourceCount)
+                    put("load_duration_ms", r.loadDurationMs)
+                })
+            },
+            onFailure = { e -> errorResult("load failed: ${e.message}") }
+        )
+    }
+
+    server.addTool(
+        name = "unload_apk",
+        description = "Release the currently-loaded APK and free memory. No-op if nothing is loaded.",
+        inputSchema = ToolSchema(properties = buildJsonObject {})
+    ) { _: CallToolRequest ->
+        val wasLoaded = holder.unload()
+        okJson(buildJsonObject {
+            put("state", "EMPTY")
+            put("was_loaded", wasLoaded)
+        })
+    }
+
     server.addTool(
         name = "get_app_info",
         description = "Return package name, version, minSdk/targetSdk, and permissions parsed from AndroidManifest.xml.",
         inputSchema = ToolSchema(properties = buildJsonObject {})
     ) { _: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val xml = findManifestText(s)
         if (xml == null) errorResult("AndroidManifest.xml not found")
         else okJson(parseManifestSummary(xml))
@@ -129,6 +189,7 @@ private fun registerTools(server: Server, s: JadxSession) {
         description = "Return the full decoded AndroidManifest.xml as text.",
         inputSchema = ToolSchema(properties = buildJsonObject {})
     ) { _: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val xml = findManifestText(s)
         if (xml == null) errorResult("AndroidManifest.xml not found") else textResult(xml)
     }
@@ -138,6 +199,7 @@ private fun registerTools(server: Server, s: JadxSession) {
         description = "Return the FQN of the LAUNCHER activity (action MAIN + category LAUNCHER).",
         inputSchema = ToolSchema(properties = buildJsonObject {})
     ) { _: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val xml = findManifestText(s) ?: return@addTool errorResult("AndroidManifest.xml not found")
         val pkg = MANIFEST_PKG_RE.find(xml)?.groupValues?.get(1).orEmpty()
         val activity = findLauncherActivity(xml)
@@ -159,6 +221,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             }
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 200
         val total = s.classes.size
@@ -182,6 +245,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("keyword")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val kw = req.arguments.strArg("keyword") ?: return@addTool errorResult("keyword is required")
         val limit = req.arguments.intArg("limit") ?: 100
         val hits = s.searchClasses(kw, limit).map { it.fullName }
@@ -202,6 +266,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
         textResult(s.getClassSource(cls))
@@ -217,6 +282,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
         textResult(s.getClassSmali(cls))
@@ -232,6 +298,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
         val items = cls.methods.map { m ->
@@ -265,6 +332,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name", "method_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val m = s.findMethod(fqn, name) ?: return@addTool errorResult("method not found: $fqn.$name")
@@ -281,6 +349,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
         val items = cls.fields.map { f ->
@@ -308,6 +377,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("method_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val limit = req.arguments.intArg("limit") ?: 100
         val hits = s.searchMethods(name, limit)
@@ -337,6 +407,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
@@ -355,6 +426,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name", "method_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
@@ -374,6 +446,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("class_name", "field_name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("field_name") ?: return@addTool errorResult("field_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
@@ -391,6 +464,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             }
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val filter = req.arguments.strArg("filter")
         val limit = req.arguments.intArg("limit") ?: 500
         val items = collectStringResources(s, filter, limit)
@@ -418,6 +492,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             }
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val filter = req.arguments.strArg("filter")?.lowercase()
         val limit = req.arguments.intArg("limit") ?: 500
         val all = s.resources.map { it.deobfName }
@@ -440,6 +515,7 @@ private fun registerTools(server: Server, s: JadxSession) {
             required = listOf("name")
         )
     ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
         val name = req.arguments.strArg("name") ?: return@addTool errorResult("name is required")
         val res = s.resources.firstOrNull { it.deobfName == name || it.originalName == name }
             ?: return@addTool errorResult("resource not found: $name")
@@ -616,6 +692,9 @@ private fun okJson(obj: JsonObject): CallToolResult =
 
 private fun errorResult(msg: String): CallToolResult =
     CallToolResult(content = listOf(TextContent(msg)), isError = true)
+
+private fun noApkLoaded(): CallToolResult =
+    errorResult("No APK loaded. Call 'load_apk' tool with an absolute APK path first, or check 'status'.")
 
 // ─── argument helpers ──────────────────────────────────────────────────────
 
