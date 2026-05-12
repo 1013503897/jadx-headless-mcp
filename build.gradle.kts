@@ -14,7 +14,7 @@ repositories {
 
 val jadxVersion = "1.5.5"
 val mcpKotlinSdkVersion = "0.12.0"
-val slf4jVersion = "2.0.16"
+val slf4jVersion = "2.0.17"
 
 dependencies {
     implementation("io.github.skylot:jadx-core:$jadxVersion")
