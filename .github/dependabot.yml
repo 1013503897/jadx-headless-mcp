@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      jadx:
+        patterns:
+          - "io.github.skylot:*"
+      mcp-kotlin-sdk:
+        patterns:
+          - "io.modelcontextprotocol:*"
+      kotlinx:
+        patterns:
+          - "org.jetbrains.kotlinx:*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"

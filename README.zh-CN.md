@@ -139,6 +139,23 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 - 仅 Java 层反编译；Unity / IL2CPP 场景请配合 IL2CPP dump 使用
 - AndroidManifest 用正则解析（够查 activity / permission，不是完整 XML 解析器）
 
+## 上游跟踪
+
+| 依赖 | 同步方式 |
+|---|---|
+| `io.github.skylot:jadx-core` 等 | Dependabot 每周扫描（PR 分组到 "jadx"）；CI 验证编译仍然通过 |
+| `io.modelcontextprotocol:kotlin-sdk` | Dependabot 每周扫描（分组 "mcp-kotlin-sdk"） |
+| `org.jetbrains.kotlinx:*` | Dependabot 每周扫描（分组 "kotlinx"） |
+| GitHub Actions 版本 | Dependabot 每月扫描 |
+
+下列项目相关但**不会自动同步**（架构不同，仅作人工关注）：
+
+- [`zinja-coder/jadx-ai-mcp`](https://github.com/zinja-coder/jadx-ai-mcp) —— JADX GUI 插件
+- [`zinja-coder/jadx-mcp-server`](https://github.com/zinja-coder/jadx-mcp-server) —— 上面那个插件的 Python 适配器
+- [`mobilehackinglab/jadx-mcp-plugin`](https://github.com/mobilehackinglab/jadx-mcp-plugin) —— 另一套 GUI 插件实现
+
+如果它们出了值得移植的新工具，欢迎来本项目开 issue。
+
 ## 致谢
 
 - [`skylot/jadx`](https://github.com/skylot/jadx) —— 底层反编译器
