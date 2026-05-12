@@ -139,6 +139,23 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 - Java decompilation only; for Unity / IL2CPP, pair with an IL2CPP dump
 - AndroidManifest is parsed with regex (sufficient for activity/permission lookup; not a full XML parser)
 
+## Upstream tracking
+
+| Dependency | Mechanism |
+|---|---|
+| `io.github.skylot:jadx-core` and friends | Dependabot weekly (opens PRs grouped under "jadx"); CI verifies the build still passes |
+| `io.modelcontextprotocol:kotlin-sdk` | Dependabot weekly (grouped under "mcp-kotlin-sdk") |
+| `org.jetbrains.kotlinx:*` | Dependabot weekly (grouped under "kotlinx") |
+| GitHub Actions versions | Dependabot monthly |
+
+Related but **not** auto-synced (different architecture; manual watch only):
+
+- [`zinja-coder/jadx-ai-mcp`](https://github.com/zinja-coder/jadx-ai-mcp) — JADX GUI plugin
+- [`zinja-coder/jadx-mcp-server`](https://github.com/zinja-coder/jadx-mcp-server) — Python adapter for the above
+- [`mobilehackinglab/jadx-mcp-plugin`](https://github.com/mobilehackinglab/jadx-mcp-plugin) — alternative GUI plugin
+
+If those projects ship a new tool worth porting, file an issue here.
+
 ## Acknowledgements
 
 - [`skylot/jadx`](https://github.com/skylot/jadx) — the underlying decompiler
