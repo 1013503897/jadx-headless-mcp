@@ -7,6 +7,7 @@ import jadx.api.JavaField
 import jadx.api.JavaMethod
 import jadx.api.JavaNode
 import jadx.api.ResourceFile
+import jadx.core.xmlgen.ResContainer
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.File
@@ -46,6 +47,87 @@ class JadxSession private constructor(
             .toList()
     }
 
+    enum class SearchScope { CLASS, METHOD, FIELD, CODE }
+
+    data class ClassHit(
+        val fqn: String,
+        val matchedIn: Set<SearchScope>,
+        val snippet: String? = null,
+    )
+
+    /**
+     * Multi-scope class search. CLASS/METHOD/FIELD are metadata-only and cheap.
+     * CODE forces decompilation of each scanned class — restrict scan size with
+     * [packagePrefix] or [maxScan], and rely on early-exit once enough hits are found.
+     */
+    fun searchClassesAdvanced(
+        term: String,
+        scopes: Set<SearchScope>,
+        packagePrefix: String? = null,
+        offset: Int = 0,
+        count: Int = 20,
+        maxScan: Int = 0,
+    ): SearchResult {
+        require(term.isNotEmpty()) { "term must not be empty" }
+        require(count >= 0 && offset >= 0)
+        val kw = term.lowercase()
+        val pkg = packagePrefix?.takeIf { it.isNotBlank() }
+        val codeScope = SearchScope.CODE in scopes
+        // Default cap: high when only metadata scopes (cheap); much lower for CODE without package.
+        val effectiveMaxScan = when {
+            maxScan > 0 -> maxScan
+            !codeScope -> classes.size
+            pkg != null -> 5_000
+            else -> 1_000
+        }
+        val needed = offset + count
+        val out = ArrayList<ClassHit>(needed.coerceAtLeast(16))
+        var scanned = 0
+        var stoppedEarly = false
+        for (cls in classes) {
+            if (pkg != null && !(cls.fullName == pkg || cls.fullName.startsWith("$pkg."))) continue
+            if (scanned >= effectiveMaxScan) { stoppedEarly = true; break }
+            scanned++
+            val matched = HashSet<SearchScope>(4)
+            var snippet: String? = null
+            if (SearchScope.CLASS in scopes && cls.fullName.lowercase().contains(kw)) {
+                matched += SearchScope.CLASS
+            }
+            if (SearchScope.METHOD in scopes && cls.methods.any { it.name.lowercase().contains(kw) }) {
+                matched += SearchScope.METHOD
+            }
+            if (SearchScope.FIELD in scopes && cls.fields.any { it.name.lowercase().contains(kw) }) {
+                matched += SearchScope.FIELD
+            }
+            if (codeScope) {
+                val code = runCatching { cls.code }.getOrNull().orEmpty()
+                if (code.isNotEmpty()) {
+                    val idx = code.indexOf(term, ignoreCase = true)
+                    if (idx >= 0) {
+                        matched += SearchScope.CODE
+                        val from = (idx - 60).coerceAtLeast(0)
+                        val to = (idx + term.length + 60).coerceAtMost(code.length)
+                        snippet = code.substring(from, to)
+                            .replace('\r', ' ').replace('\n', ' ').replace(Regex("""\s{2,}"""), " ")
+                            .trim()
+                    }
+                }
+            }
+            if (matched.isNotEmpty()) {
+                out += ClassHit(cls.fullName, matched, snippet)
+                if (out.size >= needed) break
+            }
+        }
+        val page = out.asSequence().drop(offset).take(count).toList()
+        return SearchResult(page, scanned, stoppedEarly)
+    }
+
+    data class SearchResult(
+        val hits: List<ClassHit>,
+        val scanned: Int,
+        val maxScanReached: Boolean,
+    )
+
     fun searchMethods(name: String, limit: Int): List<JavaMethod> {
         val exact = methodsByName[name]
         if (!exact.isNullOrEmpty()) return exact.take(limit)
@@ -67,11 +149,54 @@ class JadxSession private constructor(
         return cls.fields.firstOrNull { it.name == fieldName }
     }
 
-    fun getClassSource(cls: JavaClass): String = truncate(cls.code)
+    fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String =
+        truncate(cls.code, maxBytes)
 
-    fun getClassSmali(cls: JavaClass): String = truncate(cls.smali)
+    fun getClassSmali(cls: JavaClass, maxBytes: Int = maxSourceBytes): String =
+        truncate(cls.smali, maxBytes)
 
-    fun describeUsage(node: JavaNode): Map<String, String> {
+    /** Class skeleton without method/field bodies. Cheap to assemble, useful for navigation. */
+    fun summarizeClass(cls: JavaClass): Map<String, Any> {
+        val methods = cls.methods.map { m ->
+            mapOf(
+                "name" to m.name,
+                "signature" to buildString {
+                    append(m.name)
+                    append('(')
+                    append(m.arguments.joinToString(", ") { shortType(it.toString()) })
+                    append(')')
+                    append(": ")
+                    append(shortType(m.returnType.toString()))
+                },
+                "is_constructor" to m.isConstructor,
+                "def_pos" to m.defPos,
+            )
+        }
+        val fields = cls.fields.map { f ->
+            mapOf(
+                "name" to f.name,
+                "type" to shortType(f.type.toString()),
+                "def_pos" to f.defPos,
+            )
+        }
+        return mapOf(
+            "full_name" to cls.fullName,
+            "name" to cls.name,
+            "method_count" to cls.methods.size,
+            "field_count" to cls.fields.size,
+            "inner_class_count" to cls.innerClasses.size,
+            "methods" to methods,
+            "fields" to fields,
+            "inner_classes" to cls.innerClasses.map { it.fullName },
+        )
+    }
+
+    /**
+     * Describe a single xref entry. With [resolveLine] = true, includes the line
+     * in the top-level containing class's decompiled source — at the cost of
+     * forcing that class to be decompiled (cached by jadx after first call).
+     */
+    fun describeUsage(node: JavaNode, resolveLine: Boolean = true): Map<String, Any> {
         val declaring = runCatching { node.declaringClass?.fullName }.getOrNull().orEmpty()
         val kind = when (node) {
             is JavaClass -> "class"
@@ -79,19 +204,51 @@ class JadxSession private constructor(
             is JavaField -> "field"
             else -> node.javaClass.simpleName
         }
-        return mapOf(
+        val topCls = runCatching { node.topParentClass }.getOrNull()
+        val defPos = runCatching { node.defPos }.getOrNull() ?: 0
+        val line = if (resolveLine && topCls != null && defPos > 0) {
+            runCatching { topCls.getSourceLine(defPos) }.getOrNull() ?: 0
+        } else 0
+        val out = mutableMapOf<String, Any>(
             "kind" to kind,
             "name" to node.name.orEmpty(),
             "full_name" to node.fullName.orEmpty(),
             "containing_class" to declaring,
+            "top_class" to (topCls?.fullName ?: declaring),
+            "def_pos" to defPos,
         )
+        if (resolveLine) out["line"] = line
+        return out
     }
 
-    private fun truncate(s: String?): String {
+    /** Lazy-cached AndroidManifest text. Null if not present or not decodable as text. */
+    val manifestText: String? by lazy { loadManifestText() }
+
+    private fun loadManifestText(): String? {
+        val res = resources.firstOrNull {
+            val n = it.deobfName.lowercase()
+            n.endsWith("androidmanifest.xml") || n == "androidmanifest.xml"
+        } ?: return null
+        val container = runCatching { res.loadContent() }.getOrNull() ?: return null
+        return if (container.dataType == ResContainer.DataType.TEXT) container.text.codeStr else null
+    }
+
+    private fun truncate(s: String?, maxBytes: Int): String {
         val text = s ?: return ""
-        if (text.length <= maxSourceBytes) return text
-        return text.substring(0, maxSourceBytes) +
-            "\n\n... [truncated: source exceeds $maxSourceBytes bytes, total ${text.length} bytes]"
+        if (text.length <= maxBytes) return text
+        return text.substring(0, maxBytes) +
+            "\n\n... [truncated: source exceeds $maxBytes bytes, total ${text.length} bytes]"
+    }
+
+    private fun shortType(s: String): String {
+        // Strip leading package on common types to keep summary readable:
+        // "java.lang.String" -> "String", "com.foo.Bar" -> "Bar". Keep arrays/generics intact.
+        if (s.isEmpty()) return s
+        val lastDot = s.lastIndexOf('.')
+        if (lastDot < 0 || lastDot == s.length - 1) return s
+        val tail = s.substring(lastDot + 1)
+        // Don't truncate inner-class anchors written with $; keep them.
+        return tail
     }
 
     override fun close() {

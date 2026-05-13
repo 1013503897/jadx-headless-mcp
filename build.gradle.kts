@@ -56,6 +56,13 @@ tasks.named<JavaExec>("run") {
     standardInput = System.`in`
 }
 
+tasks.register<JavaExec>("bench") {
+    group = "verification"
+    description = "Run measurement harness against an APK. Usage: ./gradlew bench --args=\"/path/to.apk\""
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.atxx.jhmcp.BenchKt")
+}
+
 tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
     archiveClassifier.set("all")
     mergeServiceFiles()

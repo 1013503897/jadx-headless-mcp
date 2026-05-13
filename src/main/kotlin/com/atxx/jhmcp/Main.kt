@@ -19,6 +19,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
@@ -40,7 +41,7 @@ private data class Config(val apkPath: String?, val maxSourceBytes: Int)
 
 private fun parseArgs(args: Array<String>): Config {
     var apkPath: String? = null
-    var maxSourceBytes = 200_000
+    var maxSourceBytes = 60_000
     var i = 0
     while (i < args.size) {
         when (args[i]) {
@@ -76,7 +77,7 @@ Communicates via MCP over stdio.
 Options:
   --apk <path>              optional: APK / DEX / JAR to load eagerly at startup.
                             If omitted, use the 'load_apk' tool to load on demand.
-  --max-source-bytes <n>    max bytes per source response (default 200000)
+  --max-source-bytes <n>    max bytes per source response (default 60000; per-call max_bytes overrides)
   -h, --help                show this help
 """
 
@@ -179,19 +180,31 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         inputSchema = ToolSchema(properties = buildJsonObject {})
     ) { _: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
-        val xml = findManifestText(s)
+        val xml = s.manifestText
         if (xml == null) errorResult("AndroidManifest.xml not found")
         else okJson(parseManifestSummary(xml))
     }
 
     server.addTool(
         name = "get_android_manifest",
-        description = "Return the full decoded AndroidManifest.xml as text.",
-        inputSchema = ToolSchema(properties = buildJsonObject {})
-    ) { _: CallToolRequest ->
+        description = "Return decoded AndroidManifest.xml. Use section=permissions|activities|services|providers|receivers|application to slice (much cheaper than the full manifest, which can be 50KB+). max_bytes truncates the result.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("section") {
+                    put("type", "string")
+                    put("description", "One of: permissions, activities, services, providers, receivers, application. Omit for full manifest.")
+                }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation; overrides server default.") }
+            }
+        )
+    ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
-        val xml = findManifestText(s)
-        if (xml == null) errorResult("AndroidManifest.xml not found") else textResult(xml)
+        val xml = s.manifestText ?: return@addTool errorResult("AndroidManifest.xml not found")
+        val section = req.arguments.strArg("section")?.lowercase()
+        val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
+        val sliced = if (section.isNullOrBlank()) xml else sliceManifest(xml, section)
+            ?: return@addTool errorResult("unknown section: $section (expected permissions|activities|services|providers|receivers|application)")
+        textResult(truncate(sliced, cap))
     }
 
     server.addTool(
@@ -200,7 +213,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         inputSchema = ToolSchema(properties = buildJsonObject {})
     ) { _: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
-        val xml = findManifestText(s) ?: return@addTool errorResult("AndroidManifest.xml not found")
+        val xml = s.manifestText ?: return@addTool errorResult("AndroidManifest.xml not found")
         val pkg = MANIFEST_PKG_RE.find(xml)?.groupValues?.get(1).orEmpty()
         val activity = findLauncherActivity(xml)
         if (activity == null) errorResult("No LAUNCHER activity found")
@@ -213,21 +226,60 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "list_classes",
-        description = "Paginated list of all class FQNs in the APK.",
+        description = "Paginated list of class FQNs. Optional prefix narrows to a package subtree (e.g. 'com.applovin').",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
+                putJsonObject("prefix") {
+                    put("type", "string")
+                    put("description", "Optional FQN prefix, e.g. 'com.applovin'. Matches both equal and dot-suffix.")
+                }
                 putJsonObject("offset") { put("type", "integer"); put("default", 0) }
                 putJsonObject("limit") { put("type", "integer"); put("default", 200) }
             }
         )
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
+        val prefix = req.arguments.strArg("prefix")?.takeIf { it.isNotBlank() }
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 200
-        val total = s.classes.size
-        val page = s.classes.asSequence().drop(offset).take(limit).map { it.fullName }.toList()
+        val allNames = s.classes.map { it.fullName }
+        val filtered = if (prefix == null) allNames
+        else allNames.filter { it == prefix || it.startsWith("$prefix.") }
+        val total = filtered.size
+        val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("total", total)
+            prefix?.let { put("prefix", it) }
+            put("offset", offset)
+            put("limit", limit)
+            put("items", buildJsonArray { page.forEach { add(it) } })
+        })
+    }
+
+    server.addTool(
+        name = "get_main_application_classes_names",
+        description = "Return FQNs of classes whose package matches the AndroidManifest 'package' attribute. Useful as a lightweight 'is the right APK loaded' probe.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("offset") { put("type", "integer"); put("default", 0) }
+                putJsonObject("limit") { put("type", "integer"); put("default", 500) }
+            }
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val xml = s.manifestText ?: return@addTool errorResult("AndroidManifest.xml not found")
+        val pkg = MANIFEST_PKG_RE.find(xml)?.groupValues?.get(1).orEmpty()
+        if (pkg.isEmpty()) return@addTool errorResult("manifest 'package' attribute missing")
+        val offset = req.arguments.intArg("offset") ?: 0
+        val limit = req.arguments.intArg("limit") ?: 500
+        val matched = s.classes.asSequence()
+            .map { it.fullName }
+            .filter { it == pkg || it.startsWith("$pkg.") }
+            .toList()
+        val page = matched.asSequence().drop(offset).take(limit).toList()
+        okJson(buildJsonObject {
+            put("package", pkg)
+            put("total", matched.size)
             put("offset", offset)
             put("limit", limit)
             put("items", buildJsonArray { page.forEach { add(it) } })
@@ -236,32 +288,84 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "search_classes_by_keyword",
-        description = "Substring search over class FQNs (case-insensitive).",
+        description = "Search classes across one or more scopes: 'class' (FQN), 'method', 'field' names (all cheap, metadata-only), and 'code' (decompiled source body — expensive: decompiles each scanned class). Always pass 'package' when using 'code' scope on large APKs, otherwise the scan cap will cut you off. Accepts comma-separated 'search_in' (default 'class'). Returns hits with which scope matched and a code snippet when 'code' matches.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
-                putJsonObject("keyword") { put("type", "string") }
-                putJsonObject("limit") { put("type", "integer"); put("default", 100) }
+                putJsonObject("search_term") { put("type", "string") }
+                putJsonObject("search_in") {
+                    put("type", "string")
+                    put("description", "Comma-separated subset of: class,method,field,code. Default 'class'.")
+                    put("default", "class")
+                }
+                putJsonObject("package") {
+                    put("type", "string")
+                    put("description", "Optional FQN prefix filter, e.g. 'com.applovin'. Strongly recommended with 'code' scope.")
+                }
+                putJsonObject("offset") { put("type", "integer"); put("default", 0) }
+                putJsonObject("count") { put("type", "integer"); put("default", 20) }
+                putJsonObject("max_scan") {
+                    put("type", "integer")
+                    put("description", "Cap on classes scanned. 0 = use defaults (all classes for metadata; 5000 with package + code; 1000 without package + code).")
+                    put("default", 0)
+                }
             },
-            required = listOf("keyword")
+            required = listOf("search_term")
         )
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
-        val kw = req.arguments.strArg("keyword") ?: return@addTool errorResult("keyword is required")
-        val limit = req.arguments.intArg("limit") ?: 100
-        val hits = s.searchClasses(kw, limit).map { it.fullName }
+        val term = req.arguments.strArg("search_term")
+            ?: req.arguments.strArg("keyword")
+            ?: return@addTool errorResult("search_term is required")
+        if (term.isBlank()) return@addTool errorResult("search_term must not be blank")
+        val scopeNames = (req.arguments.strArg("search_in") ?: "class")
+            .split(',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        val unknown = scopeNames.filter { it !in setOf("class", "method", "field", "code", "comment") }
+        if (unknown.isNotEmpty()) {
+            return@addTool errorResult("unknown search_in scopes: ${unknown.joinToString(",")} (allowed: class,method,field,code; 'comment' currently aliased to code)")
+        }
+        val scopes = scopeNames.mapNotNull {
+            when (it) {
+                "class" -> JadxSession.SearchScope.CLASS
+                "method" -> JadxSession.SearchScope.METHOD
+                "field" -> JadxSession.SearchScope.FIELD
+                "code", "comment" -> JadxSession.SearchScope.CODE
+                else -> null
+            }
+        }.toSet().ifEmpty { setOf(JadxSession.SearchScope.CLASS) }
+        val pkg = req.arguments.strArg("package")?.takeIf { it.isNotBlank() }
+        val offset = req.arguments.intArg("offset") ?: 0
+        val count = req.arguments.intArg("count")
+            ?: req.arguments.intArg("limit")
+            ?: 20
+        val maxScan = req.arguments.intArg("max_scan") ?: 0
+        val result = s.searchClassesAdvanced(term, scopes, pkg, offset, count, maxScan)
         okJson(buildJsonObject {
-            put("keyword", kw)
-            put("count", hits.size)
-            put("items", buildJsonArray { hits.forEach { add(it) } })
+            put("search_term", term)
+            put("search_in", buildJsonArray { scopes.forEach { add(it.name.lowercase()) } })
+            pkg?.let { put("package", it) }
+            put("offset", offset)
+            put("count", result.hits.size)
+            put("scanned", result.scanned)
+            put("max_scan_reached", result.maxScanReached)
+            put("items", buildJsonArray {
+                result.hits.forEach { h ->
+                    addJsonObject {
+                        put("fqn", h.fqn)
+                        put("matched_in", buildJsonArray { h.matchedIn.forEach { add(it.name.lowercase()) } })
+                        h.snippet?.let { put("snippet", it) }
+                    }
+                }
+            })
         })
     }
 
     server.addTool(
         name = "get_class_source",
-        description = "Return the decompiled Java source of a class. Truncated at max-source-bytes.",
+        description = "Return decompiled Java source. Truncated at max_bytes (defaults to server-wide --max-source-bytes). Use get_class_summary first for big classes to plan smaller fetches.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation; overrides server default. Use a smaller value to save context.") }
             },
             required = listOf("class_name")
         )
@@ -269,15 +373,35 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
-        textResult(s.getClassSource(cls))
+        val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
+        textResult(s.getClassSource(cls, cap))
+    }
+
+    server.addTool(
+        name = "get_class_summary",
+        description = "Lightweight class skeleton: method signatures, field names, inner class names — no method bodies. Cheaper than get_class_source for navigation; use it to pick which method to drill into.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("class_name") { put("type", "string") }
+            },
+            required = listOf("class_name")
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
+        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        okJson(buildJsonObject {
+            s.summarizeClass(cls).forEach { (k, v) -> putAny(k, v) }
+        })
     }
 
     server.addTool(
         name = "get_smali_of_class",
-        description = "Return the smali (DEX disassembly) of a class. Truncated at max-source-bytes.",
+        description = "Return smali (DEX disassembly). Truncated at max_bytes. Smali is typically 2-3x larger than source — keep max_bytes tight.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation; overrides server default.") }
             },
             required = listOf("class_name")
         )
@@ -285,15 +409,20 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
-        textResult(s.getClassSmali(cls))
+        val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
+        textResult(s.getClassSmali(cls, cap))
     }
 
     server.addTool(
         name = "get_methods_of_class",
-        description = "List all methods of a class with their signatures.",
+        description = "List methods of a class. Paginated; use filter to narrow by name (case-insensitive substring); names_only=true for a compact name list.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
+                putJsonObject("filter") { put("type", "string"); put("description", "case-insensitive substring on method name") }
+                putJsonObject("offset") { put("type", "integer"); put("default", 0) }
+                putJsonObject("limit") { put("type", "integer"); put("default", 100) }
+                putJsonObject("names_only") { put("type", "boolean"); put("default", false) }
             },
             required = listOf("class_name")
         )
@@ -301,23 +430,31 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
-        val items = cls.methods.map { m ->
-            buildJsonObject {
-                put("name", m.name)
-                put("full_name", m.fullName)
-                put("return_type", m.returnType.toString())
-                put(
-                    "arg_types",
-                    buildJsonArray { m.arguments.forEach { add(it.toString()) } }
-                )
-                put("is_constructor", m.isConstructor)
-                put("is_class_init", m.isClassInit)
-            }
-        }
+        val filter = req.arguments.strArg("filter")?.lowercase()
+        val offset = req.arguments.intArg("offset") ?: 0
+        val limit = req.arguments.intArg("limit") ?: 100
+        val namesOnly = req.arguments.boolArg("names_only") ?: false
+        val filtered = if (filter == null) cls.methods else cls.methods.filter { it.name.lowercase().contains(filter) }
+        val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", fqn)
-            put("count", items.size)
-            put("items", buildJsonArray { items.forEach { add(it) } })
+            put("total_matching", filtered.size)
+            put("offset", offset)
+            put("limit", limit)
+            put("count", page.size)
+            put("items", buildJsonArray {
+                page.forEach { m ->
+                    if (namesOnly) add(m.name)
+                    else addJsonObject {
+                        put("name", m.name)
+                        put("full_name", m.fullName)
+                        put("return_type", m.returnType.toString())
+                        put("arg_types", buildJsonArray { m.arguments.forEach { add(it.toString()) } })
+                        put("is_constructor", m.isConstructor)
+                        put("is_class_init", m.isClassInit)
+                    }
+                }
+            })
         })
     }
 
@@ -341,10 +478,14 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_fields_of_class",
-        description = "List all fields of a class.",
+        description = "List fields of a class. Paginated; use filter to narrow by name (case-insensitive substring); names_only=true for a compact name list.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
+                putJsonObject("filter") { put("type", "string"); put("description", "case-insensitive substring on field name") }
+                putJsonObject("offset") { put("type", "integer"); put("default", 0) }
+                putJsonObject("limit") { put("type", "integer"); put("default", 200) }
+                putJsonObject("names_only") { put("type", "boolean"); put("default", false) }
             },
             required = listOf("class_name")
         )
@@ -352,17 +493,28 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
-        val items = cls.fields.map { f ->
-            buildJsonObject {
-                put("name", f.name)
-                put("full_name", f.fullName)
-                put("type", f.type.toString())
-            }
-        }
+        val filter = req.arguments.strArg("filter")?.lowercase()
+        val offset = req.arguments.intArg("offset") ?: 0
+        val limit = req.arguments.intArg("limit") ?: 200
+        val namesOnly = req.arguments.boolArg("names_only") ?: false
+        val filtered = if (filter == null) cls.fields else cls.fields.filter { it.name.lowercase().contains(filter) }
+        val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", fqn)
-            put("count", items.size)
-            put("items", buildJsonArray { items.forEach { add(it) } })
+            put("total_matching", filtered.size)
+            put("offset", offset)
+            put("limit", limit)
+            put("count", page.size)
+            put("items", buildJsonArray {
+                page.forEach { f ->
+                    if (namesOnly) add(f.name)
+                    else addJsonObject {
+                        put("name", f.name)
+                        put("full_name", f.fullName)
+                        put("type", f.type.toString())
+                    }
+                }
+            })
         })
     }
 
@@ -530,18 +682,39 @@ private fun renderUsage(
     uses: List<jadx.api.JavaNode>,
     limit: Int,
     s: JadxSession,
+    resolveLine: Boolean = true,
 ): CallToolResult {
-    val items = uses.asSequence().take(limit).map { s.describeUsage(it) }.toList()
+    val items = uses.asSequence().take(limit).map { s.describeUsage(it, resolveLine) }.toList()
     return okJson(buildJsonObject {
         put("target", target)
         put("total", uses.size)
         put("count", items.size)
         put("items", buildJsonArray {
             items.forEach { u ->
-                addJsonObject { u.forEach { (k, v) -> put(k, v) } }
+                addJsonObject { u.forEach { (k, v) -> putAny(k, v) } }
             }
         })
     })
+}
+
+private fun JsonObjectBuilder.putAny(key: String, value: Any) {
+    when (value) {
+        is String -> put(key, value)
+        is Int -> put(key, value)
+        is Long -> put(key, value)
+        is Boolean -> put(key, value)
+        is List<*> -> put(key, buildJsonArray {
+            for (e in value) when (e) {
+                is String -> add(e)
+                is Map<*, *> -> addJsonObject {
+                    @Suppress("UNCHECKED_CAST")
+                    for ((k, v) in (e as Map<String, Any>)) putAny(k, v)
+                }
+                else -> add(e?.toString().orEmpty())
+            }
+        })
+        else -> put(key, value.toString())
+    }
 }
 
 private fun renderResource(res: jadx.api.ResourceFile, maxBytes: Int): CallToolResult {
@@ -571,16 +744,48 @@ private fun renderResource(res: jadx.api.ResourceFile, maxBytes: Int): CallToolR
     }
 }
 
-private fun findManifestText(s: JadxSession): String? {
-    val res = s.resources.firstOrNull {
-        val n = it.deobfName.lowercase()
-        n.endsWith("androidmanifest.xml") || n == "androidmanifest.xml"
-    } ?: return null
-    val container = runCatching { res.loadContent() }.getOrNull() ?: return null
-    return when (container.dataType) {
-        jadx.core.xmlgen.ResContainer.DataType.TEXT -> container.text.codeStr
+/**
+ * Slice AndroidManifest XML by section name. Returns null if [section] is not recognized.
+ * For multi-instance sections (activities/services/etc.) joins all matches with blank lines.
+ */
+private fun sliceManifest(xml: String, section: String): String? {
+    return when (section) {
+        "permissions" -> {
+            val re = Regex("""<uses-permission\b[^/>]*/>|<uses-permission\b[\s\S]*?</uses-permission>""")
+            re.findAll(xml).joinToString("\n") { it.value }.ifBlank { "<!-- no <uses-permission> entries -->" }
+        }
+        "activities" -> sliceTopLevel(xml, "activity") ?: "<!-- no <activity> entries -->"
+        "services" -> sliceTopLevel(xml, "service") ?: "<!-- no <service> entries -->"
+        "providers" -> sliceTopLevel(xml, "provider") ?: "<!-- no <provider> entries -->"
+        "receivers" -> sliceTopLevel(xml, "receiver") ?: "<!-- no <receiver> entries -->"
+        "application" -> {
+            // Application open-tag with its attrs (no children — children go to other sections).
+            Regex("""<application\b[^>]*>""").find(xml)?.value ?: "<!-- <application> tag not found -->"
+        }
         else -> null
     }
+}
+
+private fun sliceTopLevel(xml: String, tag: String): String? {
+    val open = Regex("""<$tag\b""")
+    val results = mutableListOf<String>()
+    for (m in open.findAll(xml)) {
+        val start = m.range.first
+        // Find matching end: either self-closing /> or </tag>
+        val rest = xml.substring(start)
+        val selfClose = Regex("""<$tag\b[^>]*/>""").find(rest, 0)
+        val pairClose = Regex("""<$tag\b[\s\S]*?</$tag>""").find(rest, 0)
+        val chosen = when {
+            selfClose != null && pairClose != null ->
+                if (selfClose.range.last <= pairClose.range.last) selfClose else pairClose
+            selfClose != null -> selfClose
+            pairClose != null -> pairClose
+            else -> null
+        } ?: continue
+        if (chosen.range.first != 0) continue // must start at our anchor
+        results += chosen.value
+    }
+    return if (results.isEmpty()) null else results.joinToString("\n\n")
 }
 
 private val MANIFEST_PKG_RE = Regex("""<manifest\b[^>]*\bpackage="([^"]+)"""")
@@ -708,4 +913,11 @@ private fun JsonObject?.intArg(key: String): Int? {
     val v = this?.get(key) ?: return null
     val p = v as? JsonPrimitive ?: return null
     return p.intOrNull ?: p.contentOrNull?.toIntOrNull()
+}
+
+private fun JsonObject?.boolArg(key: String): Boolean? {
+    val v = this?.get(key) ?: return null
+    val p = v as? JsonPrimitive ?: return null
+    return runCatching { p.boolean }.getOrNull()
+        ?: p.contentOrNull?.lowercase()?.let { when (it) { "true" -> true; "false" -> false; else -> null } }
 }
