@@ -11,6 +11,8 @@ import jadx.core.xmlgen.ResContainer
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.File
+import java.util.Collections
+import java.util.zip.ZipFile
 
 class JadxSession private constructor(
     private val decompiler: JadxDecompiler,
@@ -262,12 +264,19 @@ class JadxSession private constructor(
             require(file.exists()) { "APK not found: $apkPath" }
             require(file.isFile) { "Not a regular file: $apkPath" }
 
+            // jadx-xapk-input only recognizes XAPKs with manifest.json (APKPure layout).
+            // Split-APK bundles without manifest.json fall through to the default zip
+            // handler and yield ~0 classes — pre-extract the base APK so JADX sees a real APK.
+            val effectiveFile = if (file.name.endsWith(".xapk", ignoreCase = true)) {
+                extractXapkBaseIfNoManifest(file) ?: file
+            } else file
+
             val outDir = File(System.getProperty("java.io.tmpdir"), "jhmcp-${System.nanoTime()}")
             outDir.mkdirs()
             outDir.deleteOnExit()
 
             val args = JadxArgs().apply {
-                inputFiles.add(file)
+                inputFiles.add(effectiveFile)
                 setOutDir(outDir)
                 isShowInconsistentCode = true
                 threadsCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
@@ -275,12 +284,37 @@ class JadxSession private constructor(
 
             val started = System.currentTimeMillis()
             System.err.println("[jhmcp] loading APK: $apkPath")
+            if (effectiveFile !== file) {
+                System.err.println("[jhmcp] XAPK has no manifest.json; extracted base APK: ${effectiveFile.name}")
+            }
             val decompiler = JadxDecompiler(args)
             decompiler.load()
             val elapsed = System.currentTimeMillis() - started
             System.err.println("[jhmcp] loaded in ${elapsed}ms, classes=${decompiler.classes.size}")
 
             return JadxSession(decompiler, apkPath, maxSourceBytes)
+        }
+
+        private fun extractXapkBaseIfNoManifest(xapk: File): File? {
+            ZipFile(xapk).use { zip ->
+                val entries = Collections.list(zip.entries())
+                if (entries.any { it.name == "manifest.json" }) return null
+
+                val baseEntry = entries
+                    .filter { !it.isDirectory && it.name.endsWith(".apk", ignoreCase = true) }
+                    .maxByOrNull { it.size }
+                    ?: return null
+
+                val outDir = File(System.getProperty("java.io.tmpdir"), "jhmcp-xapk-${System.nanoTime()}")
+                outDir.mkdirs()
+                outDir.deleteOnExit()
+                val outFile = File(outDir, File(baseEntry.name).name)
+                zip.getInputStream(baseEntry).use { input ->
+                    outFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                outFile.deleteOnExit()
+                return outFile
+            }
         }
     }
 }
