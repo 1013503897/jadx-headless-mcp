@@ -18,6 +18,8 @@ class JadxSession private constructor(
     private val decompiler: JadxDecompiler,
     val apkPath: String,
     val maxSourceBytes: Int,
+    /** Per-process override for the default `code`-scope scan cap. 0 = use built-in tiered defaults. */
+    val codeScanCap: Int = 0,
 ) : Closeable {
 
     private val log = LoggerFactory.getLogger(JadxSession::class.java)
@@ -79,8 +81,9 @@ class JadxSession private constructor(
         val effectiveMaxScan = when {
             maxScan > 0 -> maxScan
             !codeScope -> classes.size
-            pkg != null -> 5_000
-            else -> 1_000
+            codeScanCap > 0 -> codeScanCap
+            pkg != null -> 20_000
+            else -> 5_000
         }
         val needed = offset + count
         val out = ArrayList<ClassHit>(needed.coerceAtLeast(16))
@@ -258,7 +261,7 @@ class JadxSession private constructor(
     }
 
     companion object {
-        fun open(apkPath: String, maxSourceBytes: Int = 200_000): JadxSession {
+        fun open(apkPath: String, maxSourceBytes: Int = 200_000, codeScanCap: Int = 0): JadxSession {
             val log = LoggerFactory.getLogger(JadxSession::class.java)
             val file = File(apkPath)
             require(file.exists()) { "APK not found: $apkPath" }
@@ -292,7 +295,7 @@ class JadxSession private constructor(
             val elapsed = System.currentTimeMillis() - started
             System.err.println("[jhmcp] loaded in ${elapsed}ms, classes=${decompiler.classes.size}")
 
-            return JadxSession(decompiler, apkPath, maxSourceBytes)
+            return JadxSession(decompiler, apkPath, maxSourceBytes, codeScanCap)
         }
 
         private fun extractXapkBaseIfNoManifest(xapk: File): File? {
