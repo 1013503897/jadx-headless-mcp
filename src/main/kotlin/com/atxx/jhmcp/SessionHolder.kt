@@ -3,7 +3,10 @@ package com.atxx.jhmcp
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class SessionHolder(private val maxSourceBytes: Int) {
+class SessionHolder(
+    private val maxSourceBytes: Int,
+    private val codeScanCap: Int = 0,
+) {
     private val mutex = Mutex()
 
     @Volatile
@@ -21,7 +24,7 @@ class SessionHolder(private val maxSourceBytes: Int) {
         session?.close()
         session = null
         val started = System.currentTimeMillis()
-        val s = JadxSession.open(apkPath, maxSourceBytes)
+        val s = JadxSession.open(apkPath, maxSourceBytes, codeScanCap)
         val elapsed = System.currentTimeMillis() - started
         loadDurationMs = elapsed
         loadedAt = System.currentTimeMillis()
