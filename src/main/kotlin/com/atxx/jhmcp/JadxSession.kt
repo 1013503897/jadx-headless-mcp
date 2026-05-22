@@ -283,6 +283,10 @@ class JadxSession private constructor(
                 setOutDir(outDir)
                 isShowInconsistentCode = true
                 threadsCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+                // Suppress JADX's "case insensitive filesystem" rename pass so class names stay
+                // identical to the runtime FQN — Frida users rely on this. Safe because we only
+                // call decompiler.load() and read sources in-memory, never decompiler.save().
+                isFsCaseSensitive = true
             }
 
             val started = System.currentTimeMillis()
