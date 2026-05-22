@@ -37,11 +37,12 @@ import org.slf4j.LoggerFactory
 private val log = LoggerFactory.getLogger("jhmcp.Main")
 private val json = Json { prettyPrint = false; encodeDefaults = true }
 
-private data class Config(val apkPath: String?, val maxSourceBytes: Int)
+private data class Config(val apkPath: String?, val maxSourceBytes: Int, val codeScanCap: Int)
 
 private fun parseArgs(args: Array<String>): Config {
     var apkPath: String? = null
     var maxSourceBytes = 60_000
+    var codeScanCap = 0
     var i = 0
     while (i < args.size) {
         when (args[i]) {
@@ -55,6 +56,12 @@ private fun parseArgs(args: Array<String>): Config {
                 maxSourceBytes = args[i + 1].toInt()
                 i += 2
             }
+            "--max-scan" -> {
+                require(i + 1 < args.size) { "--max-scan requires a value" }
+                codeScanCap = args[i + 1].toInt()
+                require(codeScanCap >= 0) { "--max-scan must be >= 0" }
+                i += 2
+            }
             "-h", "--help" -> {
                 System.err.println(USAGE)
                 kotlin.system.exitProcess(0)
@@ -65,11 +72,11 @@ private fun parseArgs(args: Array<String>): Config {
             }
         }
     }
-    return Config(apkPath, maxSourceBytes)
+    return Config(apkPath, maxSourceBytes, codeScanCap)
 }
 
 private const val USAGE = """
-Usage: jadx-headless-mcp [--apk <path>] [--max-source-bytes N]
+Usage: jadx-headless-mcp [--apk <path>] [--max-source-bytes N] [--max-scan N]
 
 Headless JADX-based MCP server for Android APK static analysis.
 Communicates via MCP over stdio.
@@ -78,6 +85,9 @@ Options:
   --apk <path>              optional: APK / DEX / JAR to load eagerly at startup.
                             If omitted, use the 'load_apk' tool to load on demand.
   --max-source-bytes <n>    max bytes per source response (default 60000; per-call max_bytes overrides)
+  --max-scan <n>            override default cap on classes scanned by search_classes_by_keyword
+                            'code' scope (0 = use built-in tiered defaults: 20000 with package,
+                            5000 without). Per-call max_scan still overrides this.
   -h, --help                show this help
 """
 
@@ -89,7 +99,7 @@ fun main(args: Array<String>) {
     System.setOut(System.err)
 
     val cfg = parseArgs(args)
-    val holder = SessionHolder(cfg.maxSourceBytes)
+    val holder = SessionHolder(cfg.maxSourceBytes, cfg.codeScanCap)
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { runBlocking { holder.unload() } }
     })
@@ -305,7 +315,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
                 putJsonObject("count") { put("type", "integer"); put("default", 20) }
                 putJsonObject("max_scan") {
                     put("type", "integer")
-                    put("description", "Cap on classes scanned. 0 = use defaults (all classes for metadata; 5000 with package + code; 1000 without package + code).")
+                    put("description", "Cap on classes scanned. 0 = use defaults (all classes for metadata; 20000 with package + code; 5000 without package + code). Overridable server-wide via --max-scan.")
                     put("default", 0)
                 }
             },
