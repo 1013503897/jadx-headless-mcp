@@ -13,7 +13,7 @@ repositories {
 }
 
 val jadxVersion = "1.5.5"
-val mcpKotlinSdkVersion = "0.12.0"
+val mcpKotlinSdkVersion = "0.13.0"
 val slf4jVersion = "2.0.18"
 
 dependencies {
