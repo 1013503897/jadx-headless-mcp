@@ -120,7 +120,7 @@ fun main(args: Array<String>) {
         val transport = StdioServerTransport(
             System.`in`.asSource().buffered(),
             realOut.asSink().buffered()
-        )
+        ) {}
         val done = Job()
         server.onClose { done.complete() }
         server.createSession(transport)
