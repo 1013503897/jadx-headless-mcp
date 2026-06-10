@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.3.21"
+    kotlin("jvm") version "2.4.0"
     application
     id("com.gradleup.shadow") version "9.4.1"
 }
@@ -13,7 +13,7 @@ repositories {
 }
 
 val jadxVersion = "1.5.5"
-val mcpKotlinSdkVersion = "0.12.0"
+val mcpKotlinSdkVersion = "0.13.0"
 val slf4jVersion = "2.0.18"
 
 dependencies {
