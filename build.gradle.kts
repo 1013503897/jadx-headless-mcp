@@ -12,7 +12,7 @@ repositories {
     google()
 }
 
-val jadxVersion = "1.5.5"
+val jadxVersion = "1.5.6"
 val mcpKotlinSdkVersion = "0.14.0"
 val slf4jVersion = "2.0.18"
 
