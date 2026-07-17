@@ -12,7 +12,7 @@ repositories {
     google()
 }
 
-val jadxVersion = "1.5.5"
+val jadxVersion = "1.5.6"
 val mcpKotlinSdkVersion = "0.14.0"
 val slf4jVersion = "2.0.18"
 
@@ -50,6 +50,16 @@ application {
         "-Dorg.slf4j.simpleLogger.showThreadName=false",
         "-Dorg.slf4j.simpleLogger.levelInBrackets=true"
     )
+}
+
+// Windows 长 classpath 修复:CMD `set CLASSPATH=` 有 8191 字符上限,展开后的显式 jar 列表会超限
+// 导致 "The input line is too long" → java 起不来 → MCP 断连。改用目录通配 lib\*(java 自行展开)。
+tasks.named<CreateStartScripts>("startScripts") {
+    doLast {
+        windowsScript.writeText(
+            windowsScript.readText().replace(Regex("(?m)^set CLASSPATH=.*$")) { "set CLASSPATH=%APP_HOME%\\lib\\*" }
+        )
+    }
 }
 
 tasks.named<JavaExec>("run") {

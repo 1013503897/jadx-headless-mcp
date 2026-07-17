@@ -12,6 +12,11 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.File
 import java.util.Collections
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.zip.ZipFile
 
 class JadxSession private constructor(
@@ -20,9 +25,19 @@ class JadxSession private constructor(
     val maxSourceBytes: Int,
     /** Per-process override for the default `code`-scope scan cap. 0 = use built-in tiered defaults. */
     val codeScanCap: Int = 0,
+    /**
+     * Hard wall-clock budget for a single jadx decompile/smali materialization.
+     * Truncation (max_bytes) only runs *after* jadx finishes — without this timeout a fat
+     * obfuscated class can block the whole MCP process for tens of minutes.
+     */
+    val decompileTimeoutMs: Long = DEFAULT_DECOMPILE_TIMEOUT_MS,
 ) : Closeable {
 
     private val log = LoggerFactory.getLogger(JadxSession::class.java)
+    // One worker: jadx class decompilation is not assumed re-entrant across threads on one instance.
+    private val decompilePool = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "jhmcp-decompile").apply { isDaemon = true }
+    }
 
     val classes: List<JavaClass> by lazy { decompiler.classes }
     val resources: List<ResourceFile> by lazy { decompiler.resources }
@@ -105,7 +120,10 @@ class JadxSession private constructor(
                 matched += SearchScope.FIELD
             }
             if (codeScope) {
-                val code = runCatching { cls.code }.getOrNull().orEmpty()
+                // Per-class budget: never let one class hang the whole scan.
+                val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(8_000L)) {
+                    cls.code.orEmpty()
+                }.getOrElse { "" }
                 if (code.isNotEmpty()) {
                     val idx = code.indexOf(term, ignoreCase = true)
                     if (idx >= 0) {
@@ -154,46 +172,138 @@ class JadxSession private constructor(
         return cls.fields.firstOrNull { it.name == fieldName }
     }
 
-    fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String =
-        truncate(cls.code, maxBytes)
+    fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
+        val text = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
+            cls.code.orEmpty()
+        }.getOrElse { err -> return decompileErrorBanner(cls, "source", err) }
+        return truncate(text, maxBytes)
+    }
 
-    fun getClassSmali(cls: JavaClass, maxBytes: Int = maxSourceBytes): String =
-        truncate(cls.smali, maxBytes)
+    fun getClassSmali(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
+        val text = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
+            cls.smali.orEmpty()
+        }.getOrElse { err -> return decompileErrorBanner(cls, "smali", err) }
+        return truncate(text, maxBytes)
+    }
 
-    /** Class skeleton without method/field bodies. Cheap to assemble, useful for navigation. */
+    /** Decompile a single method body with the same hard timeout. */
+    fun getMethodSource(method: JavaMethod): String {
+        val owner = method.declaringClass?.fullName ?: method.fullName
+        return decompileTimed(owner, "method:${method.name}", decompileTimeoutMs) {
+            method.codeStr.orEmpty().ifEmpty {
+                "// method exists but has no decompiled body (native/abstract)"
+            }
+        }.getOrElse { err ->
+            "// ERROR: decompile timed out or failed for ${method.fullName}: ${err.message}"
+        }
+    }
+
+    /**
+     * Run [block] on the decompile worker with a wall-clock [timeoutMs] budget.
+     * On timeout the worker thread is interrupted; jadx may still be computing until
+     * it honors interrupt, but the MCP call returns immediately so the server unblocks.
+     */
+    private fun <T> decompileTimed(
+        classFqn: String,
+        kind: String,
+        timeoutMs: Long,
+        block: () -> T,
+    ): Result<T> {
+        val started = System.currentTimeMillis()
+        val future = decompilePool.submit(Callable {
+            block()
+        })
+        return try {
+            val value = future.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val elapsed = System.currentTimeMillis() - started
+            if (elapsed > 2_000) {
+                System.err.println("[jhmcp] $kind $classFqn took ${elapsed}ms")
+            }
+            Result.success(value)
+        } catch (te: TimeoutException) {
+            future.cancel(true)
+            val msg = "decompile $kind timed out after ${timeoutMs}ms for $classFqn " +
+                "(max_bytes only truncates AFTER jadx finishes — use get_class_summary / get_method_by_name)"
+            System.err.println("[jhmcp] $msg")
+            log.warn(msg)
+            Result.failure(TimeoutException(msg))
+        } catch (ee: ExecutionException) {
+            val cause = ee.cause ?: ee
+            System.err.println("[jhmcp] decompile $kind failed for $classFqn: ${cause.message}")
+            Result.failure(cause)
+        } catch (ie: InterruptedException) {
+            Thread.currentThread().interrupt()
+            future.cancel(true)
+            Result.failure(ie)
+        }
+    }
+
+    private fun decompileErrorBanner(cls: JavaClass, kind: String, err: Throwable): String {
+        val methods = runCatching { cls.methods.size }.getOrDefault(-1)
+        val fields = runCatching { cls.fields.size }.getOrDefault(-1)
+        return buildString {
+            appendLine("// ERROR: jadx $kind failed for ${cls.fullName}")
+            appendLine("// reason: ${err.message ?: err.javaClass.simpleName}")
+            appendLine("// method_count=$methods field_count=$fields")
+            appendLine("// tip: use get_class_summary, get_methods_of_class, get_method_by_name instead of full-class $kind")
+            appendLine("// decompile_timeout_ms=$decompileTimeoutMs (raise via --decompile-timeout-ms only if needed)")
+        }
+    }
+
+    /**
+     * Class skeleton without method/field bodies.
+     * Note: jadx's `JavaClass.getMethods()`/`getFields()` can force full decompile on some
+     * builds (especially control-flow-obfuscated classes). We still wrap with the hard timeout
+     * so summary cannot hang MCP for hours.
+     */
     fun summarizeClass(cls: JavaClass): Map<String, Any> {
-        val methods = cls.methods.map { m ->
+        val skeleton = decompileTimed(cls.fullName, "summary", decompileTimeoutMs) {
+            val methods = cls.methods.map { m ->
+                mapOf(
+                    "name" to m.name,
+                    "signature" to buildString {
+                        append(m.name)
+                        append('(')
+                        append(m.arguments.joinToString(", ") { shortType(it.toString()) })
+                        append(')')
+                        append(": ")
+                        append(shortType(m.returnType.toString()))
+                    },
+                    "is_constructor" to m.isConstructor,
+                    "def_pos" to m.defPos,
+                )
+            }
+            val fields = cls.fields.map { f ->
+                mapOf(
+                    "name" to f.name,
+                    "type" to shortType(f.type.toString()),
+                    "def_pos" to f.defPos,
+                )
+            }
             mapOf(
-                "name" to m.name,
-                "signature" to buildString {
-                    append(m.name)
-                    append('(')
-                    append(m.arguments.joinToString(", ") { shortType(it.toString()) })
-                    append(')')
-                    append(": ")
-                    append(shortType(m.returnType.toString()))
-                },
-                "is_constructor" to m.isConstructor,
-                "def_pos" to m.defPos,
+                "full_name" to cls.fullName,
+                "name" to cls.name,
+                "method_count" to methods.size,
+                "field_count" to fields.size,
+                "inner_class_count" to cls.innerClasses.size,
+                "methods" to methods,
+                "fields" to fields,
+                "inner_classes" to cls.innerClasses.map { it.fullName },
             )
         }
-        val fields = cls.fields.map { f ->
+        return skeleton.getOrElse { err ->
             mapOf(
-                "name" to f.name,
-                "type" to shortType(f.type.toString()),
-                "def_pos" to f.defPos,
+                "full_name" to cls.fullName,
+                "name" to cls.name,
+                "error" to (err.message ?: err.javaClass.simpleName),
+                "method_count" to -1,
+                "field_count" to -1,
+                "methods" to emptyList<Any>(),
+                "fields" to emptyList<Any>(),
+                "inner_classes" to emptyList<Any>(),
+                "hint" to "summary timed out — class likely control-flow obfuscated; try search_method_by_name / DEX strings",
             )
         }
-        return mapOf(
-            "full_name" to cls.fullName,
-            "name" to cls.name,
-            "method_count" to cls.methods.size,
-            "field_count" to cls.fields.size,
-            "inner_class_count" to cls.innerClasses.size,
-            "methods" to methods,
-            "fields" to fields,
-            "inner_classes" to cls.innerClasses.map { it.fullName },
-        )
     }
 
     /**
@@ -257,11 +367,19 @@ class JadxSession private constructor(
     }
 
     override fun close() {
+        runCatching { decompilePool.shutdownNow() }
         runCatching { decompiler.close() }
     }
 
     companion object {
-        fun open(apkPath: String, maxSourceBytes: Int = 200_000, codeScanCap: Int = 0): JadxSession {
+        const val DEFAULT_DECOMPILE_TIMEOUT_MS: Long = 30_000L
+
+        fun open(
+            apkPath: String,
+            maxSourceBytes: Int = 200_000,
+            codeScanCap: Int = 0,
+            decompileTimeoutMs: Long = DEFAULT_DECOMPILE_TIMEOUT_MS,
+        ): JadxSession {
             val log = LoggerFactory.getLogger(JadxSession::class.java)
             val file = File(apkPath)
             require(file.exists()) { "APK not found: $apkPath" }
@@ -299,7 +417,7 @@ class JadxSession private constructor(
             val elapsed = System.currentTimeMillis() - started
             System.err.println("[jhmcp] loaded in ${elapsed}ms, classes=${decompiler.classes.size}")
 
-            return JadxSession(decompiler, apkPath, maxSourceBytes, codeScanCap)
+            return JadxSession(decompiler, apkPath, maxSourceBytes, codeScanCap, decompileTimeoutMs)
         }
 
         private fun extractXapkBaseIfNoManifest(xapk: File): File? {
