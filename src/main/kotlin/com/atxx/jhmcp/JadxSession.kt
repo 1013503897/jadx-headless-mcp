@@ -121,7 +121,7 @@ class JadxSession private constructor(
             }
             if (codeScope) {
                 // Per-class budget: never let one class hang the whole scan.
-                val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(8_000L)) {
+                val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(20_000L)) {
                     cls.code.orEmpty()
                 }.getOrElse { "" }
                 if (code.isNotEmpty()) {
@@ -372,7 +372,9 @@ class JadxSession private constructor(
     }
 
     companion object {
-        const val DEFAULT_DECOMPILE_TIMEOUT_MS: Long = 30_000L
+        // Keep well under typical MCP client tool ceilings (e.g. Grok tool_timeout_sec≈150)
+        // while still aborting hour-long hangs on control-flow-obfuscated classes.
+        const val DEFAULT_DECOMPILE_TIMEOUT_MS: Long = 90_000L
 
         fun open(
             apkPath: String,
