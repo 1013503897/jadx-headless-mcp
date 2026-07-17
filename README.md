@@ -122,7 +122,13 @@ Claude Code  ──stdio JSON-RPC──>  jadx-headless-mcp (JVM)
                                                         └── JadxDecompiler (jadx-core)
 ```
 
-Lazy decompilation: only `get_class_source` and `get_smali_of_class` trigger per-class decompilation. Index building at startup is metadata-only.
+Lazy decompilation: only `get_class_source` and `get_smali_of_class` (and `get_method_by_name` / `code` search) trigger per-class decompilation. Index building at startup is metadata-only.
+
+**Important:** `max_bytes` truncates the response **after** jadx finishes materializing the class — it does **not** stop a slow decompile early. Fat obfuscated classes (e.g. large ViewModels) previously could block the whole MCP process for tens of minutes until the client’s multi-hour tool ceiling. As of the decompile-timeout fix:
+
+- Server hard timeout: `--decompile-timeout-ms` (default **30000**)
+- On timeout the tool returns an `// ERROR: ... timed out ...` banner immediately
+- Prefer `get_class_summary` + `get_method_by_name` for large classes
 
 ## Memory tuning
 

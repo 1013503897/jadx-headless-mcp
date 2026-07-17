@@ -37,12 +37,18 @@ import org.slf4j.LoggerFactory
 private val log = LoggerFactory.getLogger("jhmcp.Main")
 private val json = Json { prettyPrint = false; encodeDefaults = true }
 
-private data class Config(val apkPath: String?, val maxSourceBytes: Int, val codeScanCap: Int)
+private data class Config(
+    val apkPath: String?,
+    val maxSourceBytes: Int,
+    val codeScanCap: Int,
+    val decompileTimeoutMs: Long,
+)
 
 private fun parseArgs(args: Array<String>): Config {
     var apkPath: String? = null
     var maxSourceBytes = 60_000
     var codeScanCap = 0
+    var decompileTimeoutMs = JadxSession.DEFAULT_DECOMPILE_TIMEOUT_MS
     var i = 0
     while (i < args.size) {
         when (args[i]) {
@@ -62,6 +68,12 @@ private fun parseArgs(args: Array<String>): Config {
                 require(codeScanCap >= 0) { "--max-scan must be >= 0" }
                 i += 2
             }
+            "--decompile-timeout-ms" -> {
+                require(i + 1 < args.size) { "--decompile-timeout-ms requires a value" }
+                decompileTimeoutMs = args[i + 1].toLong()
+                require(decompileTimeoutMs >= 1_000L) { "--decompile-timeout-ms must be >= 1000" }
+                i += 2
+            }
             "-h", "--help" -> {
                 System.err.println(USAGE)
                 kotlin.system.exitProcess(0)
@@ -72,11 +84,11 @@ private fun parseArgs(args: Array<String>): Config {
             }
         }
     }
-    return Config(apkPath, maxSourceBytes, codeScanCap)
+    return Config(apkPath, maxSourceBytes, codeScanCap, decompileTimeoutMs)
 }
 
 private const val USAGE = """
-Usage: jadx-headless-mcp [--apk <path>] [--max-source-bytes N] [--max-scan N]
+Usage: jadx-headless-mcp [--apk <path>] [--max-source-bytes N] [--max-scan N] [--decompile-timeout-ms N]
 
 Headless JADX-based MCP server for Android APK static analysis.
 Communicates via MCP over stdio.
@@ -85,9 +97,14 @@ Options:
   --apk <path>              optional: APK / DEX / JAR to load eagerly at startup.
                             If omitted, use the 'load_apk' tool to load on demand.
   --max-source-bytes <n>    max bytes per source response (default 60000; per-call max_bytes overrides)
+                            NOTE: truncation runs AFTER jadx finishes materializing the class —
+                            it does NOT stop a hung decompile early. Use --decompile-timeout-ms for that.
   --max-scan <n>            override default cap on classes scanned by search_classes_by_keyword
                             'code' scope (0 = use built-in tiered defaults: 20000 with package,
                             5000 without). Per-call max_scan still overrides this.
+  --decompile-timeout-ms <n> hard wall-clock budget per get_class_source / get_smali_of_class /
+                            get_method_by_name / code-search class (default 30000). Prevents one
+                            fat obfuscated class from blocking the MCP process for hours.
   -h, --help                show this help
 """
 
@@ -99,7 +116,7 @@ fun main(args: Array<String>) {
     System.setOut(System.err)
 
     val cfg = parseArgs(args)
-    val holder = SessionHolder(cfg.maxSourceBytes, cfg.codeScanCap)
+    val holder = SessionHolder(cfg.maxSourceBytes, cfg.codeScanCap, cfg.decompileTimeoutMs)
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { runBlocking { holder.unload() } }
     })
@@ -144,6 +161,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
             snap.resourceCount?.let { put("resource_count", it) }
             snap.loadDurationMs?.let { put("load_duration_ms", it) }
             snap.loadedAtEpochMs?.let { put("loaded_at_epoch_ms", it) }
+            snap.decompileTimeoutMs?.let { put("decompile_timeout_ms", it) }
         })
     }
 
@@ -166,6 +184,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
                     put("class_count", r.classCount)
                     put("resource_count", r.resourceCount)
                     put("load_duration_ms", r.loadDurationMs)
+                    put("decompile_timeout_ms", r.decompileTimeoutMs)
                 })
             },
             onFailure = { e -> errorResult("load failed: ${e.message}") }
@@ -371,11 +390,11 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_class_source",
-        description = "Return decompiled Java source. Truncated at max_bytes (defaults to server-wide --max-source-bytes). Use get_class_summary first for big classes to plan smaller fetches.",
+        description = "Return decompiled Java source. Truncated at max_bytes AFTER jadx finishes (defaults to server --max-source-bytes). Hard-aborts after decompile_timeout_ms (default 30s) so fat/obfuscated classes cannot hang MCP for hours. Prefer get_class_summary + get_method_by_name for large classes.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo") }
-                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation; overrides server default. Use a smaller value to save context.") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation AFTER decompile; does not speed up jadx. Prefer smaller fetches via get_method_by_name.") }
             },
             required = listOf("class_name")
         )
@@ -407,11 +426,11 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_smali_of_class",
-        description = "Return smali (DEX disassembly). Truncated at max_bytes. Smali is typically 2-3x larger than source — keep max_bytes tight.",
+        description = "Return smali (DEX disassembly). Truncated at max_bytes AFTER materialization. Smali is often 2-3x source size. Hard-aborts after decompile_timeout_ms (default 30s). For huge classes use get_methods_of_class + get_method_by_name.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
-                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation; overrides server default.") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation AFTER smali generation; does not speed up jadx.") }
             },
             required = listOf("class_name")
         )
@@ -444,7 +463,18 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 100
         val namesOnly = req.arguments.boolArg("names_only") ?: false
-        val filtered = if (filter == null) cls.methods else cls.methods.filter { it.name.lowercase().contains(filter) }
+        // cls.methods can force full decompile on obfuscated classes — use timed summary path
+        val summary = s.summarizeClass(cls)
+        if (summary["error"] != null) {
+            return@addTool errorResult(
+                "list methods timed out or failed for $fqn: ${summary["error"]}. " +
+                    "Try search_method_by_name or DEX-level tools."
+            )
+        }
+        @Suppress("UNCHECKED_CAST")
+        val all = (summary["methods"] as? List<Map<String, Any>>).orEmpty()
+        val filtered = if (filter == null) all
+        else all.filter { (it["name"] as? String)?.lowercase()?.contains(filter) == true }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", fqn)
@@ -454,14 +484,13 @@ private fun registerTools(server: Server, holder: SessionHolder) {
             put("count", page.size)
             put("items", buildJsonArray {
                 page.forEach { m ->
-                    if (namesOnly) add(m.name)
+                    if (namesOnly) add(m["name"] as String)
                     else addJsonObject {
-                        put("name", m.name)
-                        put("full_name", m.fullName)
-                        put("return_type", m.returnType.toString())
-                        put("arg_types", buildJsonArray { m.arguments.forEach { add(it.toString()) } })
-                        put("is_constructor", m.isConstructor)
-                        put("is_class_init", m.isClassInit)
+                        put("name", m["name"] as String)
+                        put("full_name", "$fqn.${m["name"]}")
+                        put("signature", m["signature"] as? String ?: "")
+                        put("is_constructor", m["is_constructor"] as? Boolean ?: false)
+                        put("def_pos", (m["def_pos"] as? Number)?.toInt() ?: 0)
                     }
                 }
             })
@@ -483,7 +512,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val m = s.findMethod(fqn, name) ?: return@addTool errorResult("method not found: $fqn.$name")
-        textResult(m.codeStr.orEmpty().ifEmpty { "// method exists but has no decompiled body (native/abstract)" })
+        textResult(s.getMethodSource(m))
     }
 
     server.addTool(
