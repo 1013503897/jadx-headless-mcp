@@ -8,6 +8,9 @@ A headless MCP (stdio) server for Android APK static analysis, written in Kotlin
 
 Requires JDK 17+. Single Gradle module, no submodules.
 
+Local checkout: `C:/work/git_code/hook-lab/jadx-headless-mcp`.  
+MCP name `jadx-headless` → launcher `build/install/jadx-headless-mcp/bin/jadx-headless-mcp.bat` (Claude `~/.claude.json` / Grok `~/.grok/config.toml`).
+
 ## Build & run
 
 ```bash
@@ -51,7 +54,9 @@ Three Kotlin files total; keep changes scoped to whichever layer owns the concer
 ### Critical conventions
 
 - **stdout is reserved for MCP JSON-RPC frames.** `Main.kt` reroutes `System.out` to `System.err` early in `main()` because some logging libraries print banners to stdout that would corrupt the protocol. Never `println` from anywhere; use `System.err` or SLF4J (configured to log to stderr via `slf4jSimpleLogger.logFile=System.err` in `applicationDefaultJvmArgs`).
-- **`maxSourceBytes` truncation** is enforced both in `JadxSession.truncate` (for class source/smali) and in `Main.renderResource` / `truncate` (for resource files). Configurable via `--max-source-bytes` (default 200_000).
+- **`maxSourceBytes` truncation** is enforced both in `JadxSession.truncate` (for class source/smali) and in `Main.renderResource` / `truncate` (for resource files). Configurable via `--max-source-bytes` (default 60_000 in Main). **Truncation runs after jadx finishes** — it does not abort a hung decompile.
+- **`decompileTimeoutMs` hard wall-clock budget** (default **30_000**, CLI `--decompile-timeout-ms`) wraps every full-class materialization (`get_class_source`, `get_smali_of_class`, method source, summary, code-search). Without this, control-flow-obfuscated GCash classes could block the single MCP process until the client multi-hour tool ceiling (looked like “jadx hung for 1–2 hours”). On timeout the tool returns an `// ERROR: ... timed out ...` banner immediately.
+
 - **Tool result shape:** use `okJson(buildJsonObject { … })`, `textResult(text)`, or `errorResult(msg)`. For "no APK loaded" the helper is `noApkLoaded()`. Tool error returns set `isError = true` rather than throwing.
 - **One APK per process.** `SessionHolder.load` closes the previous session before opening a new one; concurrency around this is enforced by a `Mutex`. Callers must not retain references to a previous `JadxSession` across a `load_apk` call.
 

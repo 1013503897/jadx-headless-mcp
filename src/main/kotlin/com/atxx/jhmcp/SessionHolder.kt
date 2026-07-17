@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.withLock
 class SessionHolder(
     private val maxSourceBytes: Int,
     private val codeScanCap: Int = 0,
+    private val decompileTimeoutMs: Long = JadxSession.DEFAULT_DECOMPILE_TIMEOUT_MS,
 ) {
     private val mutex = Mutex()
 
@@ -24,12 +25,12 @@ class SessionHolder(
         session?.close()
         session = null
         val started = System.currentTimeMillis()
-        val s = JadxSession.open(apkPath, maxSourceBytes, codeScanCap)
+        val s = JadxSession.open(apkPath, maxSourceBytes, codeScanCap, decompileTimeoutMs)
         val elapsed = System.currentTimeMillis() - started
         loadDurationMs = elapsed
         loadedAt = System.currentTimeMillis()
         session = s
-        LoadResult(s.apkPath, s.classes.size, s.resources.size, elapsed)
+        LoadResult(s.apkPath, s.classes.size, s.resources.size, elapsed, s.decompileTimeoutMs)
     }
 
     suspend fun unload(): Boolean = mutex.withLock {
@@ -53,6 +54,7 @@ class SessionHolder(
                 resourceCount = s.resources.size,
                 loadDurationMs = loadDurationMs,
                 loadedAtEpochMs = loadedAt,
+                decompileTimeoutMs = s.decompileTimeoutMs,
             )
         }
     }
@@ -62,6 +64,7 @@ class SessionHolder(
         val classCount: Int,
         val resourceCount: Int,
         val loadDurationMs: Long,
+        val decompileTimeoutMs: Long = JadxSession.DEFAULT_DECOMPILE_TIMEOUT_MS,
     )
 
     data class Snapshot(
@@ -71,5 +74,6 @@ class SessionHolder(
         val resourceCount: Int? = null,
         val loadDurationMs: Long? = null,
         val loadedAtEpochMs: Long? = null,
+        val decompileTimeoutMs: Long? = null,
     )
 }
