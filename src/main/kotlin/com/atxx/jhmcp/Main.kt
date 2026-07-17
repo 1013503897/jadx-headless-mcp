@@ -103,7 +103,7 @@ Options:
                             'code' scope (0 = use built-in tiered defaults: 20000 with package,
                             5000 without). Per-call max_scan still overrides this.
   --decompile-timeout-ms <n> hard wall-clock budget per get_class_source / get_smali_of_class /
-                            get_method_by_name / code-search class (default 30000). Prevents one
+                            get_method_by_name / code-search class (default 90000). Prevents one
                             fat obfuscated class from blocking the MCP process for hours.
   -h, --help                show this help
 """
@@ -390,7 +390,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_class_source",
-        description = "Return decompiled Java source. Truncated at max_bytes AFTER jadx finishes (defaults to server --max-source-bytes). Hard-aborts after decompile_timeout_ms (default 30s) so fat/obfuscated classes cannot hang MCP for hours. Prefer get_class_summary + get_method_by_name for large classes.",
+        description = "Return decompiled Java source. Truncated at max_bytes AFTER jadx finishes (defaults to server --max-source-bytes). Hard-aborts after decompile_timeout_ms (default 90s) so fat/obfuscated classes cannot hang MCP for hours. Prefer get_class_summary + get_method_by_name for large classes.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo") }
@@ -426,7 +426,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_smali_of_class",
-        description = "Return smali (DEX disassembly). Truncated at max_bytes AFTER materialization. Smali is often 2-3x source size. Hard-aborts after decompile_timeout_ms (default 30s). For huge classes use get_methods_of_class + get_method_by_name.",
+        description = "Return smali (DEX disassembly). Truncated at max_bytes AFTER materialization. Smali is often 2-3x source size. Hard-aborts after decompile_timeout_ms (default 90s). For huge classes use get_methods_of_class + get_method_by_name.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
