@@ -143,13 +143,6 @@ The launcher sets `-XX:MaxRAMPercentage=60.0` by default. Override via `JAVA_OPT
 JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 ```
 
-## Limitations
-
-- One APK at a time per process (call `load_apk` to swap)
-- Read-only; no rename / mutation tools yet
-- Java decompilation only; for Unity / IL2CPP, pair with an IL2CPP dump
-- AndroidManifest is parsed with regex (sufficient for activity/permission lookup; not a full XML parser)
-
 ## Upstream tracking
 
 | Dependency | Mechanism |
