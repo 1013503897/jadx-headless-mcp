@@ -132,13 +132,6 @@ Claude Code  ──stdio JSON-RPC──>  jadx-headless-mcp (JVM)
 JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 ```
 
-## 已知局限
-
-- 单进程同时只能持有一个 APK（用 `load_apk` 切换）
-- 只读，暂未实现 rename / 修改类工具
-- 仅 Java 层反编译；Unity / IL2CPP 场景请配合 IL2CPP dump 使用
-- AndroidManifest 用正则解析（够查 activity / permission，不是完整 XML 解析器）
-
 ## 上游跟踪
 
 | 依赖 | 同步方式 |
