@@ -42,21 +42,110 @@ class JadxSession private constructor(
     val classes: List<JavaClass> by lazy { decompiler.classes }
     val resources: List<ResourceFile> by lazy { decompiler.resources }
 
+    /**
+     * Every class INCLUDING nested/inner ones. jadx's `decompiler.classes` returns only top-level
+     * classes; inner classes (and Kotlin `$Companion`) are reachable solely via `getInnerClasses()`.
+     * Flattening them here is what makes `Outer$Companion` / `Outer.Inner` addressable by name.
+     */
+    val allClasses: List<JavaClass> by lazy {
+        val out = ArrayList<JavaClass>(classes.size + classes.size / 4)
+        val stack = ArrayDeque(classes)
+        while (stack.isNotEmpty()) {
+            val c = stack.removeLast()
+            out += c
+            val inners = runCatching { c.innerClasses }.getOrNull()
+            if (!inners.isNullOrEmpty()) stack.addAll(inners)
+        }
+        out
+    }
+
     private val classByFqn: Map<String, JavaClass> by lazy {
-        classes.associateBy { it.fullName }
+        allClasses.associateBy { it.fullName }
+    }
+
+    /** Keyed on the runtime/raw name (nested classes joined with `$`, e.g. `Outer$Companion`). */
+    private val classByRawName: Map<String, JavaClass> by lazy {
+        allClasses.associateBy { it.rawName }
+    }
+
+    /**
+     * Canonical lookup: `$` and `.` nesting separators unified so a caller can address a class
+     * with either `Outer$Inner`, `Outer.Inner`, `Outer$Companion`, or `Outer.Companion`.
+     * Both `fullName` (dotted) and `rawName` (`$`) are indexed; exact indexes are tried first.
+     */
+    private val classByCanon: Map<String, JavaClass> by lazy {
+        val map = HashMap<String, JavaClass>(allClasses.size * 2)
+        for (cls in allClasses) {
+            map[canon(cls.fullName)] = cls
+            map.putIfAbsent(canon(cls.rawName), cls)
+        }
+        map
     }
 
     private val methodsByName: Map<String, List<JavaMethod>> by lazy {
-        val map = HashMap<String, MutableList<JavaMethod>>(classes.size * 4)
-        for (cls in classes) {
-            for (m in cls.methods) {
+        val map = HashMap<String, MutableList<JavaMethod>>(allClasses.size * 4)
+        for (cls in allClasses) {
+            val methods = runCatching { cls.methods }.getOrNull() ?: continue
+            for (m in methods) {
                 map.getOrPut(m.name) { mutableListOf() }.add(m)
             }
         }
         map
     }
 
+    /** Exact match on the dotted FQN only (legacy behaviour). Prefer [resolveClass]. */
     fun findClass(fqn: String): JavaClass? = classByFqn[fqn]
+
+    /** Unify nested-class separators so `$` and `.` forms collapse to one key. */
+    private fun canon(s: String): String = s.replace('$', '.')
+
+    data class ClassResolution(val cls: JavaClass?, val candidates: List<String>)
+
+    /**
+     * Robust class resolution. In precedence order:
+     *  1. exact dotted FQN (`com.foo.Outer.Inner`)
+     *  2. exact raw name (`com.foo.Outer$Inner`, `...$Companion`)
+     *  3. canonical match (`$`/`.` nesting unified) — fixes `Outer$Companion` vs `Outer.Companion`
+     *  4. fuzzy suffix: a class whose canonical FQN ends with the (canonical) query — auto-picked only if unique
+     *  5. simple-name match — auto-picked only if unique, otherwise returned as candidates
+     */
+    fun resolveClassDetailed(query: String): ClassResolution {
+        val q = query.trim()
+        classByFqn[q]?.let { return ClassResolution(it, emptyList()) }
+        classByRawName[q]?.let { return ClassResolution(it, emptyList()) }
+        val cq = canon(q).trim('.')
+        classByCanon[cq]?.let { return ClassResolution(it, emptyList()) }
+        // Tier 1: precise suffix on the whole (canonical) query.
+        val tier1 = allClasses.asSequence()
+            .filter { val cf = canon(it.fullName); cf == cq || cf.endsWith(".$cq") }
+            .distinctBy { it.fullName }
+            .take(50)
+            .toList()
+        if (tier1.size == 1) return ClassResolution(tier1[0], emptyList())
+        if (tier1.size > 1) return ClassResolution(null, tier1.map { it.fullName })
+        // Tier 2: bare simple-name match (broad) — only auto-pick when unique.
+        val lastSeg = cq.substringAfterLast('.')
+        val tier2 = allClasses.asSequence()
+            .filter { canon(it.fullName).substringAfterLast('.') == lastSeg }
+            .distinctBy { it.fullName }
+            .take(50)
+            .toList()
+        if (tier2.size == 1) return ClassResolution(tier2[0], emptyList())
+        return ClassResolution(null, tier2.map { it.fullName })
+    }
+
+    /** Convenience: the resolved class (exact / canonical / unique-fuzzy) or null. */
+    fun resolveClass(query: String): JavaClass? = resolveClassDetailed(query).cls
+
+    /** Inner classes of [cls] with both dotted and raw (`$`) forms so callers can copy an addressable name. */
+    fun innerClasses(cls: JavaClass): List<Map<String, Any>> =
+        cls.innerClasses.map {
+            mapOf(
+                "full_name" to it.fullName,
+                "raw_name" to it.rawName,
+                "name" to it.name,
+            )
+        }
 
     fun searchClasses(keyword: String, limit: Int): List<JavaClass> {
         val kw = keyword.lowercase()
@@ -163,12 +252,18 @@ class JadxSession private constructor(
     }
 
     fun findMethod(classFqn: String, methodName: String): JavaMethod? {
-        val cls = findClass(classFqn) ?: return null
+        val cls = resolveClass(classFqn) ?: return null
         return cls.methods.firstOrNull { it.name == methodName }
     }
 
+    /** All methods matching [methodName] in the class (handles overloads). */
+    fun findMethods(classFqn: String, methodName: String): List<JavaMethod> {
+        val cls = resolveClass(classFqn) ?: return emptyList()
+        return cls.methods.filter { it.name == methodName }
+    }
+
     fun findField(classFqn: String, fieldName: String): JavaField? {
-        val cls = findClass(classFqn) ?: return null
+        val cls = resolveClass(classFqn) ?: return null
         return cls.fields.firstOrNull { it.name == fieldName }
     }
 
@@ -196,6 +291,155 @@ class JadxSession private constructor(
         }.getOrElse { err ->
             "// ERROR: decompile timed out or failed for ${method.fullName}: ${err.message}"
         }
+    }
+
+    // ── Decompile-failure detection & seamless smali fallback ────────────────────
+
+    /** Result of a source/body fetch that may have transparently fallen back to smali. */
+    data class SmartCode(
+        val text: String,
+        val kind: String,          // "java" | "smali"
+        val fellBack: Boolean,
+        val markers: List<String>, // failure markers that triggered the fallback
+    )
+
+    /**
+     * Fetch decompiled Java for a class; if jadx emitted an anti-decompile / decompile-failure
+     * banner (goto stubs, "Code decompiled incorrectly", "Method not decompiled", …), transparently
+     * return the class smali instead — prefixed with a `// [jadx java-decompile failed → smali]`
+     * marker so the caller knows. Set [smaliFallback] = false to force the (partial) Java.
+     */
+    fun getClassSourceSmart(cls: JavaClass, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
+        val java = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
+            cls.code.orEmpty()
+        }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "source", err), "java", false, emptyList()) }
+        val markers = detectDecompileFailure(java)
+        if (smaliFallback && markers.any { it in STRONG_FAILURE_MARKERS }) {
+            val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
+                cls.smali.orEmpty()
+            }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "smali", err), "smali", true, markers) }
+            return SmartCode(truncate(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
+        }
+        return SmartCode(truncate(java, maxBytes), "java", false, markers)
+    }
+
+    /**
+     * Java body of a single method, or its smali when the Java body is an anti-decompile stub.
+     * The pinpoint version of [getClassSourceSmart] — only the requested method's smali is returned.
+     */
+    fun getMethodBodySmart(method: JavaMethod, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
+        val java = getMethodSource(method)
+        val markers = detectDecompileFailure(java)
+        if (smaliFallback && markers.any { it in STRONG_FAILURE_MARKERS }) {
+            val owner = method.declaringClass
+            if (owner != null) {
+                val ms = getMethodSmali(owner, method.name)
+                if (ms.found) {
+                    val body = ms.blocks.joinToString("\n\n")
+                    return SmartCode(truncate(smaliFallbackHeader(method.fullName, markers) + body, maxBytes), "smali", true, markers)
+                }
+            }
+        }
+        return SmartCode(truncate(java, maxBytes), "java", false, markers)
+    }
+
+    private fun smaliFallbackHeader(name: String, markers: List<String>): String = buildString {
+        appendLine("// [jadx java-decompile failed → smali]")
+        appendLine("// target: $name")
+        appendLine("// markers: ${markers.joinToString("; ")}")
+        appendLine("// (Java body was an anti-decompile stub; showing smali. Pass smali_fallback=false for the partial Java.)")
+        appendLine()
+    }
+
+    /** Substrings that reliably indicate jadx could NOT produce a usable Java body for a method. */
+    private val STRONG_FAILURE_MARKERS = listOf(
+        "Code decompiled incorrectly, please refer to instructions dump",
+        "Method not decompiled",
+        "Method code generation error",
+        "Can't load method instructions",
+        "Method dump skipped, instruction units count",
+    )
+
+    /** Softer signal — reported but does not, on its own, force a fallback (jadx often still emits usable code). */
+    private val SOFT_FAILURE_MARKERS = listOf(
+        "unreachable blocks",
+        "Failed to decompile",
+    )
+
+    /** Return the failure markers present in [code] (strong markers first). Empty = clean decompile. */
+    fun detectDecompileFailure(code: String): List<String> {
+        if (code.isEmpty()) return emptyList()
+        val out = ArrayList<String>(2)
+        for (m in STRONG_FAILURE_MARKERS) if (code.contains(m, ignoreCase = true)) out += m
+        for (m in SOFT_FAILURE_MARKERS) if (code.contains(m, ignoreCase = true)) out += m
+        return out
+    }
+
+    // ── Method-level smali extraction ───────────────────────────────────────────
+
+    data class MethodSmali(val name: String, val blocks: List<String>, val found: Boolean, val note: String? = null)
+
+    /**
+     * Extract the `.method … .end method` block(s) for [methodName] out of the class smali.
+     * jadx has no per-method smali API, so we materialize the class disassembly once and slice it.
+     * Returns every overload; an empty [blocks] with found=false if no such method name exists.
+     */
+    fun getMethodSmali(cls: JavaClass, methodName: String): MethodSmali {
+        val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
+            cls.smali.orEmpty()
+        }.getOrElse { err ->
+            return MethodSmali(methodName, emptyList(), false, "smali generation failed: ${err.message}")
+        }
+        if (smali.isEmpty()) return MethodSmali(methodName, emptyList(), false, "class has no smali (no code)")
+        val blocks = extractMethodBlocks(smali, methodName)
+        return MethodSmali(methodName, blocks, blocks.isNotEmpty())
+    }
+
+    /** Slice a byte window out of the class smali (for paging huge classes). */
+    fun getClassSmaliWindow(cls: JavaClass, offset: Int, limit: Int): Triple<String, Int, Int> {
+        val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
+            cls.smali.orEmpty()
+        }.getOrElse { err -> return Triple(decompileErrorBanner(cls, "smali", err), 0, 0) }
+        val total = smali.length
+        if (offset >= total) return Triple("", total, total)
+        val from = offset.coerceIn(0, total)
+        val to = (from + limit).coerceAtMost(total)
+        return Triple(smali.substring(from, to), total, to)
+    }
+
+    private val METHOD_DIRECTIVE = Regex("""^\s*\.method\b(.*)$""")
+
+    /** Extract `.method`…`.end method` blocks whose method name equals [methodName]. */
+    private fun extractMethodBlocks(smali: String, methodName: String): List<String> {
+        val out = ArrayList<String>(2)
+        val lines = smali.split('\n')
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i]
+            val m = METHOD_DIRECTIVE.find(line)
+            if (m != null) {
+                val name = parseSmaliMethodName(m.groupValues[1])
+                val start = i
+                var j = i + 1
+                while (j < lines.size && !lines[j].trimStart().startsWith(".end method")) j++
+                if (name == methodName) {
+                    val end = j.coerceAtMost(lines.size - 1)
+                    out += lines.subList(start, (end + 1).coerceAtMost(lines.size)).joinToString("\n").trimEnd()
+                }
+                i = j + 1
+            } else {
+                i++
+            }
+        }
+        return out
+    }
+
+    /** From the text after `.method` (e.g. `public static foo(Ljava/lang/String;)V`) pull the method name. */
+    private fun parseSmaliMethodName(afterDirective: String): String {
+        val paren = afterDirective.indexOf('(')
+        val head = if (paren >= 0) afterDirective.substring(0, paren) else afterDirective
+        // name is the last whitespace-delimited token before '('
+        return head.trim().substringAfterLast(' ').substringAfterLast('\t').trim()
     }
 
     /**

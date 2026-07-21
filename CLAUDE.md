@@ -51,6 +51,15 @@ Three Kotlin files total; keep changes scoped to whichever layer owns the concer
 - `SessionHolder.kt` — thread-safe single-slot lifecycle (`load`, `unload`, `snapshot`, `current`). Always go through this rather than holding a `JadxSession` reference elsewhere.
 - `JadxSession.kt` — all direct contact with `jadx.api.*`. New static-analysis primitives (finding nodes, describing xrefs, etc.) belong here so `Main.kt` stays a thin tool-dispatcher.
 
+### Class resolution, inner classes & smali fallback (v0.3.0)
+
+- **`decompiler.classes` is TOP-LEVEL ONLY.** Inner / `$Companion` / synthetic nested classes are reachable *only* via `JavaClass.getInnerClasses()`. `JadxSession.allClasses` flattens them recursively; the FQN/raw/canonical indexes and `methodsByName` are built from `allClasses`, which is what makes `Outer$Companion` addressable. If you add a new "find a class" path, resolve through `resolveClass` / `resolveClassDetailed`, never re-scan `classes` directly.
+- **`resolveClass(query)`** accepts dotted (`Outer.Inner`), raw (`Outer$Inner`, `…$Companion`), canonical (`$`/`.` unified), and unique fuzzy suffix / simple-name forms. `resolveClassDetailed` returns candidates when ambiguous. All class-taking tools go through `Main.resolveClassArg` (rich not-found error with candidates).
+- **Seamless smali fallback:** `getClassSourceSmart` / `getMethodBodySmart` detect jadx decompile-failure banners (`detectDecompileFailure`: strong markers like *"Code decompiled incorrectly"*, *"Method not decompiled"*, *"Can't load method instructions"*; soft: *"unreachable blocks"*). On a STRONG marker they return smali with a `// [jadx java-decompile failed → smali]` header (opt out via `smali_fallback=false`). jadx has **no per-method smali API** — `getMethodSmali` slices `.method`…`.end method` blocks out of the class disassembly (`JavaClass.getSmali()` / `ClassNode.getDisassembledCode()`).
+- **New tools:** `get_method_body`, `get_method_smali`, `get_inner_classes`, `resolve_class`; enhanced: `get_class_source` + `get_method_by_name` (`smali_fallback`), `get_smali_of_class` (`offset` paging with `total_bytes`/`next_offset`). 26 tools total.
+
+> **Rebuild gotcha:** MCP clients keep `com.atxx.jhmcp.MainKt` server processes alive and a supervisor respawns them within ~2 s, so they hold read locks on `build/install/jadx-headless-mcp/lib/*.jar` and `installDist` fails with *"Unable to delete file …"*. Kill only the **server** processes (match command line `*com.atxx.jhmcp.MainKt*`, NOT `*jadx-headless-mcp*` — that also matches the Gradle client and kills your own build) in a fast loop *while* `installDist` runs, then stop the loop so clients respawn on the new jar.
+
 ### Critical conventions
 
 - **stdout is reserved for MCP JSON-RPC frames.** `Main.kt` reroutes `System.out` to `System.err` early in `main()` because some logging libraries print banners to stdout that would corrupt the protocol. Never `println` from anywhere; use `System.err` or SLF4J (configured to log to stderr via `slf4jSimpleLogger.logFile=System.err` in `applicationDefaultJvmArgs`).

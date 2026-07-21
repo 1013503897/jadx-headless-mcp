@@ -13,7 +13,7 @@ The existing JADX MCP servers ([`zinja-coder/jadx-mcp-server`](https://github.co
 - running multiple instances in parallel (GUI baseline is 300–500 MB each)
 - low-latency tool calls where the Python ↔ HTTP ↔ JVM hop adds up
 
-This project loads APKs through the `jadx-core` library directly and exposes 20 tools as a single MCP stdio server.
+This project loads APKs through the `jadx-core` library directly and exposes 26 tools as a single MCP stdio server.
 
 ## Tools
 
@@ -32,12 +32,17 @@ This project loads APKs through the `jadx-core` library directly and exposes 20 
 | `get_main_activity_class` | LAUNCHER activity FQN |
 | `list_classes` | Paginated class FQN list |
 | `search_classes_by_keyword` | Substring search over class FQNs |
-| `get_class_source` | Decompiled Java source |
-| `get_smali_of_class` | Smali disassembly |
+| `get_class_source` | Decompiled Java source. Auto-falls back to smali when jadx hits anti-decompile stubs (marker `// [jadx java-decompile failed → smali]`; `smali_fallback=false` to opt out). Resolves inner/`$Companion` names. |
+| `get_class_summary` | Class skeleton (method signatures, fields, inner-class names) — no method bodies |
+| `get_smali_of_class` | Smali disassembly. Pageable via `offset` (byte offset into full smali); header reports `total_bytes`/`next_offset` |
 | `get_methods_of_class` | Method signatures |
-| `get_method_by_name` | Source of a single method |
+| `get_method_by_name` | Java source of a single method; same smali fallback as `get_class_source` |
+| `get_method_body` | One method as Java-if-possible-else-smali, in a JSON envelope (`mode`, `fell_back`, `markers`); handles overloads |
+| `get_method_smali` | Smali of a single method (all overloads), sliced from the class disassembly |
+| `get_inner_classes` | Inner/nested classes with both dotted `full_name` and raw `$`-joined `raw_name` |
+| `resolve_class` | Resolve an inner/`$Companion`/fuzzy class name to its exact FQN, or list candidates |
 | `get_fields_of_class` | Field list with types |
-| `search_method_by_name` | Global method search |
+| `search_method_by_name` | Global method search (includes inner-class methods) |
 | `get_xrefs_to_class` | References to a class |
 | `get_xrefs_to_method` | References to a method |
 | `get_xrefs_to_field` | References to a field |

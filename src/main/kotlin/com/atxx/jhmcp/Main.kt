@@ -122,7 +122,7 @@ fun main(args: Array<String>) {
     })
 
     val server = Server(
-        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.2.0"),
+        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.3.0"),
         options = ServerOptions(
             capabilities = ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = null))
         )
@@ -390,20 +390,24 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_class_source",
-        description = "Return decompiled Java source. Truncated at max_bytes AFTER jadx finishes (defaults to server --max-source-bytes). Hard-aborts after decompile_timeout_ms (default 90s) so fat/obfuscated classes cannot hang MCP for hours. Prefer get_class_summary + get_method_by_name for large classes.",
+        description = "Return decompiled Java source. If jadx hits anti-decompile stubs (goto obfuscation, 'Code decompiled incorrectly' / 'Method not decompiled' banners), it transparently returns the class SMALI instead, prefixed with '// [jadx java-decompile failed → smali]' (disable with smali_fallback=false). Accepts inner/\$Companion names. Truncated at max_bytes AFTER jadx finishes; hard-aborts after decompile_timeout_ms (default 90s). Prefer get_class_summary + get_method_by_name/get_method_body for large classes.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
-                putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo") }
+                putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo. Inner/Companion forms (Outer\$Inner, Outer.Companion) are accepted.") }
                 putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation AFTER decompile; does not speed up jadx. Prefer smaller fetches via get_method_by_name.") }
+                putJsonObject("smali_fallback") { put("type", "boolean"); put("description", "Auto-fall back to smali when Java decompilation fails (default true). Set false to force the partial Java.") ; put("default", true) }
             },
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
         val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
-        textResult(s.getClassSource(cls, cap))
+        val fallback = req.arguments.boolArg("smali_fallback") ?: true
+        val smart = s.getClassSourceSmart(cls, cap, fallback)
+        textResult(smart.text)
     }
 
     server.addTool(
@@ -418,7 +422,8 @@ private fun registerTools(server: Server, holder: SessionHolder) {
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
         okJson(buildJsonObject {
             s.summarizeClass(cls).forEach { (k, v) -> putAny(k, v) }
         })
@@ -426,20 +431,38 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_smali_of_class",
-        description = "Return smali (DEX disassembly). Truncated at max_bytes AFTER materialization. Smali is often 2-3x source size. Hard-aborts after decompile_timeout_ms (default 90s). For huge classes use get_methods_of_class + get_method_by_name.",
+        description = "Return smali (DEX disassembly). Smali is often 2-3x source size, so large classes truncate. To page a huge class pass offset (byte offset into the full smali) with max_bytes as the window size; the response header reports total_bytes and next_offset. For a single method prefer get_method_smali. Hard-aborts after decompile_timeout_ms (default 90s). Accepts inner/\$Companion names.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
-                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation AFTER smali generation; does not speed up jadx.") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call window/truncation size (default server --max-source-bytes).") }
+                putJsonObject("offset") { put("type", "integer"); put("description", "Byte offset into the full class smali to start from (for paging). Default 0."); put("default", 0) }
             },
             required = listOf("class_name")
         )
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
         val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
-        textResult(s.getClassSmali(cls, cap))
+        val offset = (req.arguments.intArg("offset") ?: 0).coerceAtLeast(0)
+        if (offset == 0) {
+            // Backwards-compatible path, but annotate paging info when the class overflows the window.
+            val (window, total, next) = s.getClassSmaliWindow(cls, 0, cap)
+            if (total > cap) {
+                val header = "// [smali window] offset=0 len=${window.length} total_bytes=$total next_offset=$next " +
+                    "(pass offset=$next to continue, or use get_method_smali)\n\n"
+                textResult(header + window)
+            } else {
+                textResult(window)
+            }
+        } else {
+            val (window, total, next) = s.getClassSmaliWindow(cls, offset, cap)
+            val more = if (next < total) " next_offset=$next" else " (end)"
+            val header = "// [smali window] offset=$offset len=${window.length} total_bytes=$total$more\n\n"
+            textResult(header + window)
+        }
     }
 
     server.addTool(
@@ -458,16 +481,18 @@ private fun registerTools(server: Server, holder: SessionHolder) {
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        val (cls, errC) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool errC!!
         val filter = req.arguments.strArg("filter")?.lowercase()
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 100
         val namesOnly = req.arguments.boolArg("names_only") ?: false
         // cls.methods can force full decompile on obfuscated classes — use timed summary path
+        val resolvedFqn = cls.fullName
         val summary = s.summarizeClass(cls)
         if (summary["error"] != null) {
             return@addTool errorResult(
-                "list methods timed out or failed for $fqn: ${summary["error"]}. " +
+                "list methods timed out or failed for $resolvedFqn: ${summary["error"]}. " +
                     "Try search_method_by_name or DEX-level tools."
             )
         }
@@ -477,7 +502,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         else all.filter { (it["name"] as? String)?.lowercase()?.contains(filter) == true }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
-            put("class_name", fqn)
+            put("class_name", resolvedFqn)
             put("total_matching", filtered.size)
             put("offset", offset)
             put("limit", limit)
@@ -487,7 +512,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
                     if (namesOnly) add(m["name"] as String)
                     else addJsonObject {
                         put("name", m["name"] as String)
-                        put("full_name", "$fqn.${m["name"]}")
+                        put("full_name", "$resolvedFqn.${m["name"]}")
                         put("signature", m["signature"] as? String ?: "")
                         put("is_constructor", m["is_constructor"] as? Boolean ?: false)
                         put("def_pos", (m["def_pos"] as? Number)?.toInt() ?: 0)
@@ -499,11 +524,12 @@ private fun registerTools(server: Server, holder: SessionHolder) {
 
     server.addTool(
         name = "get_method_by_name",
-        description = "Return the decompiled source of a single method. If overloaded, returns the first match.",
+        description = "Return the decompiled Java source of a single method. If overloaded, returns the first match. If jadx fails to decompile the body (anti-decompile stub), transparently returns that method's SMALI with a '// [jadx java-decompile failed → smali]' marker (disable via smali_fallback=false). Accepts inner/\$Companion class names.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
                 putJsonObject("method_name") { put("type", "string") }
+                putJsonObject("smali_fallback") { put("type", "boolean"); put("description", "Fall back to method smali when Java decompile fails (default true)."); put("default", true) }
             },
             required = listOf("class_name", "method_name")
         )
@@ -511,8 +537,127 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
-        val m = s.findMethod(fqn, name) ?: return@addTool errorResult("method not found: $fqn.$name")
-        textResult(s.getMethodSource(m))
+        val m = s.findMethod(fqn, name) ?: return@addTool methodNotFound(s, fqn, name)
+        val fallback = req.arguments.boolArg("smali_fallback") ?: true
+        textResult(s.getMethodBodySmart(m, s.maxSourceBytes, fallback).text)
+    }
+
+    server.addTool(
+        name = "get_method_body",
+        description = "Return ONE method as Java if it decompiles, else its SMALI — with a JSON envelope reporting which. The method-level counterpart of get_class_source's smali fallback; use it to read a single method out of a huge/obfuscated class without dumping the whole class. Reports mode ('java'|'smali'), fell_back, and any decompile-failure markers. Accepts inner/\$Companion class names and overloaded methods (set overload_index).",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("class_name") { put("type", "string") }
+                putJsonObject("method_name") { put("type", "string") }
+                putJsonObject("overload_index") { put("type", "integer"); put("description", "0-based index when the name is overloaded (default 0)."); put("default", 0) }
+                putJsonObject("smali_fallback") { put("type", "boolean"); put("description", "Fall back to method smali when Java decompile fails (default true)."); put("default", true) }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation of the body.") }
+            },
+            required = listOf("class_name", "method_name")
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
+        val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
+        val idx = (req.arguments.intArg("overload_index") ?: 0).coerceAtLeast(0)
+        val fallback = req.arguments.boolArg("smali_fallback") ?: true
+        val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
+        val overloads = s.findMethods(fqn, name)
+        if (overloads.isEmpty()) return@addTool methodNotFound(s, fqn, name)
+        val m = overloads.getOrNull(idx) ?: return@addTool errorResult(
+            "overload_index $idx out of range: $fqn.$name has ${overloads.size} overload(s)"
+        )
+        val smart = s.getMethodBodySmart(m, cap, fallback)
+        okJson(buildJsonObject {
+            put("class_name", m.declaringClass?.fullName ?: fqn)
+            put("method_name", name)
+            put("full_name", m.fullName)
+            put("overload_index", idx)
+            put("overload_count", overloads.size)
+            put("mode", smart.kind)
+            put("fell_back", smart.fellBack)
+            put("markers", buildJsonArray { smart.markers.forEach { add(it) } })
+            put("body", smart.text)
+        })
+    }
+
+    server.addTool(
+        name = "get_method_smali",
+        description = "Return the SMALI of a single method (all overloads of the name), sliced out of the class disassembly. Cheap way to read one method from a huge class instead of get_smali_of_class. Accepts inner/\$Companion class names.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("class_name") { put("type", "string") }
+                putJsonObject("method_name") { put("type", "string") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation.") }
+            },
+            required = listOf("class_name", "method_name")
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
+        val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
+        val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
+        val ms = s.getMethodSmali(cls, name)
+        if (!ms.found) {
+            return@addTool errorResult(
+                "no smali for method ${cls.fullName}.$name" + (ms.note?.let { " ($it)" } ?: "") +
+                    ". Check get_methods_of_class for the exact name (constructors are <init>/<clinit>)."
+            )
+        }
+        val joined = ms.blocks.joinToString("\n\n")
+        val header = "// ${cls.fullName}.$name — ${ms.blocks.size} overload(s)\n\n"
+        textResult(truncate(header + joined, cap))
+    }
+
+    server.addTool(
+        name = "get_inner_classes",
+        description = "List the inner/nested classes of a class, each with its dotted full_name AND raw_name (the \$-joined runtime form, e.g. Outer\$Companion) so you can address them directly. Resolves \$Companion / inner / fuzzy names.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("class_name") { put("type", "string") }
+            },
+            required = listOf("class_name")
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
+        val inners = s.innerClasses(cls)
+        okJson(buildJsonObject {
+            put("class_name", cls.fullName)
+            put("raw_name", cls.rawName)
+            put("count", inners.size)
+            put("items", buildJsonArray {
+                inners.forEach { m -> addJsonObject { m.forEach { (k, v) -> putAny(k, v) } } }
+            })
+        })
+    }
+
+    server.addTool(
+        name = "resolve_class",
+        description = "Resolve a possibly-inaccurate class name (inner/\$Companion/dotted/fuzzy) to its exact FQN, or list candidate FQNs when ambiguous. Use this when get_class_source says 'class not found'. Metadata-only (no decompile).",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("class_name") { put("type", "string") }
+            },
+            required = listOf("class_name")
+        )
+    ) { req: CallToolRequest ->
+        val s = holder.current() ?: return@addTool noApkLoaded()
+        val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
+        val r = s.resolveClassDetailed(fqn)
+        okJson(buildJsonObject {
+            put("query", fqn)
+            put("resolved", r.cls != null)
+            r.cls?.let {
+                put("full_name", it.fullName)
+                put("raw_name", it.rawName)
+            }
+            put("candidates", buildJsonArray { r.candidates.forEach { add(it) } })
+        })
     }
 
     server.addTool(
@@ -531,7 +676,8 @@ private fun registerTools(server: Server, holder: SessionHolder) {
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
         val filter = req.arguments.strArg("filter")?.lowercase()
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 200
@@ -539,7 +685,7 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val filtered = if (filter == null) cls.fields else cls.fields.filter { it.name.lowercase().contains(filter) }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
-            put("class_name", fqn)
+            put("class_name", cls.fullName)
             put("total_matching", filtered.size)
             put("offset", offset)
             put("limit", limit)
@@ -601,8 +747,9 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val cls = s.findClass(fqn) ?: return@addTool errorResult("class not found: $fqn")
-        renderUsage(fqn, cls.useIn, limit, s)
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
+        renderUsage(cls.fullName, cls.useIn, limit, s)
     }
 
     server.addTool(
@@ -621,8 +768,8 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val m = s.findMethod(fqn, name) ?: return@addTool errorResult("method not found: $fqn.$name")
-        renderUsage("$fqn.$name", m.useIn, limit, s)
+        val m = s.findMethod(fqn, name) ?: return@addTool methodNotFound(s, fqn, name)
+        renderUsage(m.fullName, m.useIn, limit, s)
     }
 
     server.addTool(
@@ -641,8 +788,11 @@ private fun registerTools(server: Server, holder: SessionHolder) {
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("field_name") ?: return@addTool errorResult("field_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val f = s.findField(fqn, name) ?: return@addTool errorResult("field not found: $fqn.$name")
-        renderUsage("$fqn.$name", f.useIn, limit, s)
+        val (cls, err) = s.resolveClassArg(fqn)
+        if (cls == null) return@addTool err!!
+        val f = cls.fields.firstOrNull { it.name == name }
+            ?: return@addTool errorResult("field not found: ${cls.fullName}.$name — see get_fields_of_class")
+        renderUsage(f.fullName, f.useIn, limit, s)
     }
 
     server.addTool(
@@ -939,6 +1089,42 @@ private fun errorResult(msg: String): CallToolResult =
 
 private fun noApkLoaded(): CallToolResult =
     errorResult("No APK loaded. Call 'load_apk' tool with an absolute APK path first, or check 'status'.")
+
+/** Resolve a class arg (exact / `$Companion` / canonical / unique-fuzzy) or a rich not-found error. */
+private fun JadxSession.resolveClassArg(fqn: String): Pair<jadx.api.JavaClass?, CallToolResult?> {
+    val r = resolveClassDetailed(fqn)
+    if (r.cls != null) return r.cls to null
+    val msg = buildString {
+        append("class not found: $fqn")
+        if (r.candidates.isNotEmpty()) {
+            append(" — ${r.candidates.size} candidate(s) matched by suffix/simple-name: ")
+            append(r.candidates.take(15).joinToString(", "))
+            if (r.candidates.size > 15) append(", …")
+            append(". Retry with one of these exact FQNs (or use get_inner_classes / resolve_class).")
+        } else {
+            append(" — no exact/fuzzy match. Try list_classes, search_classes_by_keyword, or resolve_class.")
+        }
+    }
+    return null to errorResult(msg)
+}
+
+/** Method-not-found error: distinguishes "class missing" from "class OK but no such method". */
+private fun methodNotFound(s: JadxSession, fqn: String, method: String): CallToolResult {
+    val r = s.resolveClassDetailed(fqn)
+    val cls = r.cls
+        ?: return errorResult(
+            "method not found: $fqn.$method — class did not resolve." +
+                if (r.candidates.isNotEmpty()) " Class candidates: ${r.candidates.take(10).joinToString(", ")}" else ""
+        )
+    val names = runCatching { cls.methods.map { it.name }.distinct() }.getOrDefault(emptyList())
+    val near = names.filter { it.contains(method, ignoreCase = true) }.take(10)
+    return errorResult(buildString {
+        append("method not found: ${cls.fullName}.$method")
+        if (near.isNotEmpty()) append(" — similar methods: ${near.joinToString(", ")}")
+        else if (names.isNotEmpty()) append(" — class has ${names.size} method name(s); see get_methods_of_class")
+        append(". (Constructors are <init>/<clinit>.)")
+    })
+}
 
 // ─── argument helpers ──────────────────────────────────────────────────────
 
