@@ -13,7 +13,7 @@
 - 多 APK 并行（GUI 单实例基线就要 300–500 MB）
 - 高频工具调用（Python ↔ HTTP ↔ JVM 三跳累积可观）
 
-本项目直接通过 `jadx-core` library 加载 APK，作为单个 MCP stdio 服务器暴露 20 个工具。
+本项目直接通过 `jadx-core` library 加载 APK，作为单个 MCP stdio 服务器暴露 28 个工具。
 
 ## 工具列表
 
@@ -44,6 +44,8 @@
 | `get_strings` | 字符串资源（可按子串过滤） |
 | `list_resource_files` | 所有资源文件名 |
 | `get_resource_file` | 资源文件内容（文本或 base64） |
+| `export_apk_resources` | 导出 APK 文件型 `res/` 目录到磁盘（AXML 解码 + drawable 原样拷贝） |
+| `export_arsc_resources` | 导出 `resources.arsc` 解码出的值资源树（`res/values*`、`public.xml`）到磁盘 |
 
 ## 构建
 

@@ -13,7 +13,7 @@ The existing JADX MCP servers ([`zinja-coder/jadx-mcp-server`](https://github.co
 - running multiple instances in parallel (GUI baseline is 300–500 MB each)
 - low-latency tool calls where the Python ↔ HTTP ↔ JVM hop adds up
 
-This project loads APKs through the `jadx-core` library directly and exposes 26 tools as a single MCP stdio server.
+This project loads APKs through the `jadx-core` library directly and exposes 28 tools as a single MCP stdio server.
 
 ## Tools
 
@@ -49,6 +49,8 @@ This project loads APKs through the `jadx-core` library directly and exposes 26 
 | `get_strings` | String resources with optional filter |
 | `list_resource_files` | Resource file names |
 | `get_resource_file` | Resource file content (text or base64) |
+| `export_apk_resources` | Export the APK's file-based `res/` tree to disk (decoded AXML + verbatim drawables) |
+| `export_arsc_resources` | Export the decoded `resources.arsc` value tree (`res/values*`, `public.xml`) to disk |
 
 ## Build
 
