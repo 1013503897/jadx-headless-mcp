@@ -7,7 +7,9 @@ import jadx.api.JavaField
 import jadx.api.JavaMethod
 import jadx.api.JavaNode
 import jadx.api.ResourceFile
+import jadx.api.ResourceType
 import jadx.core.xmlgen.ResContainer
+import jadx.core.xmlgen.ResourcesSaver
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.File
@@ -610,6 +612,105 @@ class JadxSession private constructor(
         return tail
     }
 
+    // ─── resource export (mirrors jadx GUI right-click "Export") ─────────────────
+    // Both entry points reuse jadx-core's own `ResourcesSaver` — the exact Runnable the
+    // GUI's context-menu "Export" runs. It walks each ResourceFile's ResContainer and
+    // writes by DataType: TEXT (decoded AXML/values) via SaveCode, DECODED_DATA via
+    // Files.write, RES_LINK (drawables/raw/fonts) copied verbatim from the zip, and
+    // RES_TABLE recursed into its sub-files. Path-traversal is blocked by jadx itself.
+
+    /**
+     * Export the APK's *file-based* resources — every [ResourceFile] whose deobfuscated
+     * name starts with [prefix] (default `res/`: layouts, drawables, raw, xml, ...) — into
+     * [outDir], preserving the `res/...` directory layout. This is the top-level `res` node
+     * under "Resources" in the GUI. Runs on the decompile worker under a [timeoutMs] budget.
+     */
+    fun exportFileResources(
+        outDir: File,
+        prefix: String = "res/",
+        timeoutMs: Long = DEFAULT_EXPORT_TIMEOUT_MS,
+        manifestLimit: Int = 300,
+    ): Map<String, Any> {
+        val norm = prefix.replace('\\', '/').trimStart('/').lowercase()
+        val targets = resources.filter {
+            it.deobfName.replace('\\', '/').lowercase().startsWith(norm)
+        }
+        return runExport("file-resources[$prefix]", outDir, targets, timeoutMs, manifestLimit)
+    }
+
+    /**
+     * Export the *decoded* `resources.arsc` value tree (the `res/values` XMLs + `res/values/public.xml`,
+     * i.e. strings/colors/dimens/styles/arrays/plurals reconstructed from the binary resource table)
+     * into [outDir]. This is the `res` node shown under `resources.arsc` in the GUI. These entries do
+     * not exist as standalone files in the APK — they live only inside the arsc table.
+     */
+    fun exportArscResources(
+        outDir: File,
+        timeoutMs: Long = DEFAULT_EXPORT_TIMEOUT_MS,
+        manifestLimit: Int = 300,
+    ): Map<String, Any> {
+        val targets = resources.filter {
+            it.type == ResourceType.ARSC || it.deobfName.lowercase().endsWith("resources.arsc")
+        }
+        if (targets.isEmpty()) {
+            return mapOf(
+                "out_dir" to outDir.absolutePath,
+                "sources_scoped" to 0,
+                "file_count" to 0,
+                "total_bytes" to 0L,
+                "files" to emptyList<Any>(),
+                "files_truncated" to false,
+                "errors" to listOf("no resources.arsc found in this APK"),
+            )
+        }
+        return runExport("arsc-resources", outDir, targets, timeoutMs, manifestLimit)
+    }
+
+    private fun runExport(
+        label: String,
+        outDir: File,
+        targets: List<ResourceFile>,
+        timeoutMs: Long,
+        manifestLimit: Int,
+    ): Map<String, Any> {
+        outDir.mkdirs()
+        val errors = mutableListOf<String>()
+        val run = decompileTimed(label, "export", timeoutMs) {
+            for (rf in targets) {
+                try {
+                    ResourcesSaver(decompiler, outDir, rf).run()
+                } catch (t: Throwable) {
+                    errors += "${rf.deobfName}: ${t.message ?: t.javaClass.simpleName}"
+                }
+            }
+        }
+        run.exceptionOrNull()?.let {
+            errors += "export interrupted (partial output may be present): ${it.message ?: it.javaClass.simpleName}"
+        }
+        // Manifest = full listing of the output tree after the export (accurate for a dedicated out_dir).
+        val files = ArrayList<Pair<String, Long>>()
+        var total = 0L
+        if (outDir.exists()) {
+            outDir.walkTopDown().filter { it.isFile }.forEach { f ->
+                val rel = f.relativeTo(outDir).path.replace('\\', '/')
+                val len = f.length()
+                total += len
+                files += rel to len
+            }
+        }
+        files.sortBy { it.first }
+        val sample = files.take(manifestLimit).map { (p, sz) -> mapOf<String, Any>("path" to p, "size" to sz) }
+        return mapOf(
+            "out_dir" to outDir.absolutePath,
+            "sources_scoped" to targets.size,
+            "file_count" to files.size,
+            "total_bytes" to total,
+            "files" to sample,
+            "files_truncated" to (files.size > sample.size),
+            "errors" to errors,
+        )
+    }
+
     override fun close() {
         runCatching { decompilePool.shutdownNow() }
         runCatching { decompiler.close() }
@@ -619,6 +720,10 @@ class JadxSession private constructor(
         // Keep well under typical MCP client tool ceilings (e.g. Grok tool_timeout_sec≈150)
         // while still aborting hour-long hangs on control-flow-obfuscated classes.
         const val DEFAULT_DECOMPILE_TIMEOUT_MS: Long = 90_000L
+
+        // Whole-tree resource export can decode thousands of binary XMLs; give it a much
+        // wider wall-clock budget than a single class decompile. Overridable per call.
+        const val DEFAULT_EXPORT_TIMEOUT_MS: Long = 300_000L
 
         fun open(
             apkPath: String,
