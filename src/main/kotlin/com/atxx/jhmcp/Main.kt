@@ -33,7 +33,6 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.slf4j.LoggerFactory
-import java.io.File
 
 private val log = LoggerFactory.getLogger("jhmcp.Main")
 private val json = Json { prettyPrint = false; encodeDefaults = true }
@@ -123,7 +122,7 @@ fun main(args: Array<String>) {
     })
 
     val server = Server(
-        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.4.0"),
+        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.5.0"),
         options = ServerOptions(
             capabilities = ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = null))
         )
@@ -863,65 +862,6 @@ private fun registerTools(server: Server, holder: SessionHolder) {
             ?: return@addTool errorResult("resource not found: $name")
         renderResource(res, s.maxSourceBytes)
     }
-
-    server.addTool(
-        name = "export_apk_resources",
-        description = "Export the APK's file-based resource tree to a directory on disk (same as jadx GUI " +
-            "right-click \"Export\" on the top-level res folder under Resources). Binary AXML layouts/xml are " +
-            "decoded to text; drawables/raw/fonts are copied from the zip verbatim; res/ layout is preserved. " +
-            "By default exports everything under 'res/'; set 'prefix' to export another subtree (e.g. 'assets/'). " +
-            "Returns the output directory and a manifest of written files. NOTE: writes files to the local disk.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("out_dir") { put("type", "string"); put("description", "Target directory. Default: <apk_dir>/<apk_name>.apk_res next to the loaded APK. Existing same-named files are overwritten.") }
-                putJsonObject("prefix") { put("type", "string"); put("description", "Resource path prefix to export (case-insensitive). Default 'res/'.") }
-                putJsonObject("timeout_ms") { put("type", "integer"); put("description", "Wall-clock budget for the whole export. Default 300000.") }
-                putJsonObject("manifest_limit") { put("type", "integer"); put("description", "Max file entries listed in the response manifest. Default 300.") }
-            }
-        )
-    ) { req: CallToolRequest ->
-        val s = holder.current() ?: return@addTool noApkLoaded()
-        val prefix = req.arguments.strArg("prefix") ?: "res/"
-        val outDir = resolveExportDir(req.arguments.strArg("out_dir"), s.apkPath, "apk_res")
-        val timeout = req.arguments.intArg("timeout_ms")?.toLong() ?: JadxSession.DEFAULT_EXPORT_TIMEOUT_MS
-        val limit = req.arguments.intArg("manifest_limit") ?: 300
-        val result = s.exportFileResources(outDir, prefix, timeout, limit)
-        okJson(buildJsonObject { result.forEach { (k, v) -> putAny(k, v) } })
-    }
-
-    server.addTool(
-        name = "export_arsc_resources",
-        description = "Export the decoded resources.arsc value tree to a directory on disk (same as jadx GUI " +
-            "right-click \"Export\" on the res node under resources.arsc). Reconstructs res/values*/*.xml " +
-            "(strings/colors/dimens/styles/arrays/plurals) and res/values/public.xml from the binary resource " +
-            "table — these do not exist as standalone files in the APK. Complements export_apk_resources. " +
-            "Returns the output directory and a manifest of written files. NOTE: writes files to the local disk.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("out_dir") { put("type", "string"); put("description", "Target directory. Default: <apk_dir>/<apk_name>.arsc_res next to the loaded APK. Existing same-named files are overwritten.") }
-                putJsonObject("timeout_ms") { put("type", "integer"); put("description", "Wall-clock budget for the whole export. Default 300000.") }
-                putJsonObject("manifest_limit") { put("type", "integer"); put("description", "Max file entries listed in the response manifest. Default 300.") }
-            }
-        )
-    ) { req: CallToolRequest ->
-        val s = holder.current() ?: return@addTool noApkLoaded()
-        val outDir = resolveExportDir(req.arguments.strArg("out_dir"), s.apkPath, "arsc_res")
-        val timeout = req.arguments.intArg("timeout_ms")?.toLong() ?: JadxSession.DEFAULT_EXPORT_TIMEOUT_MS
-        val limit = req.arguments.intArg("manifest_limit") ?: 300
-        val result = s.exportArscResources(outDir, timeout, limit)
-        okJson(buildJsonObject { result.forEach { (k, v) -> putAny(k, v) } })
-    }
-}
-
-/**
- * Resolve the export target directory. If [outDirArg] is given it is used verbatim; otherwise a
- * default is derived next to the loaded APK: `<apk_dir>/<apk_file_name>.<suffix>`.
- */
-private fun resolveExportDir(outDirArg: String?, apkPath: String, suffix: String): File {
-    if (!outDirArg.isNullOrBlank()) return File(outDirArg)
-    val apk = File(apkPath)
-    val parent = apk.absoluteFile.parentFile ?: File(".")
-    return File(parent, "${apk.name}.$suffix")
 }
 
 // ─── tool helpers ───────────────────────────────────────────────────────────
