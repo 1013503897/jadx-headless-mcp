@@ -4,17 +4,6 @@
 
 直接基于 `jadx-core` 构建的 headless MCP 服务器，用于 Android APK 静态分析。无需 JADX GUI、无需 Python 适配器、无需安装插件 —— 单个 JVM 进程通过 stdio 跑 MCP 协议。
 
-## 为什么做这个
-
-现有的 JADX MCP 项目（[`zinja-coder/jadx-mcp-server`](https://github.com/zinja-coder/jadx-mcp-server)、[`mobilehackinglab/jadx-mcp-plugin`](https://github.com/mobilehackinglab/jadx-mcp-plugin)）都需要打开 `jadx-gui` 并加载插件才能工作。这在下列场景下很别扭：
-
-- 批量 APK 分析流水线
-- 无显示器的 CI / Docker / 服务器部署
-- 多 APK 并行（GUI 单实例基线就要 300–500 MB）
-- 高频工具调用（Python ↔ HTTP ↔ JVM 三跳累积可观）
-
-本项目直接通过 `jadx-core` library 加载 APK，作为单个 MCP stdio 服务器暴露 26 个工具。
-
 ## 工具列表
 
 ### 会话管理
@@ -55,12 +44,14 @@
 
 产物：`build/install/jadx-headless-mcp/bin/jadx-headless-mcp`（Windows 下还有 `.bat`）。
 
-如果要打 fat jar：
+如果要打可移植 fat jar（单文件）：
 
 ```bash
 ./gradlew shadowJar
 # build/libs/jadx-headless-mcp-<version>-all.jar
 ```
+
+> **不想自己构建？** 每个 [GitHub Release](../../releases) 都附带预构建产物（fat jar + 发行 zip）—— 下载后直接让 MCP 配置指向它即可。
 
 ## 运行
 
@@ -82,7 +73,23 @@
 
 ## Claude Code MCP 配置
 
-注册一个 entry 即可，运行时按需切换 APK，**不用改配置**：
+### 最快：用 CLI 注册
+
+一行命令，无需手改 JSON。`-s user` 写进全局 `~/.claude.json`；默认的 `local` scope 只对当前项目生效：
+
+```bash
+# installDist 启动脚本
+claude mcp add jadx-headless -s user -- C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat
+
+# ……或可移植 fat jar（单文件，需 java 在 PATH 上）
+claude mcp add jadx-headless -s user -- java -jar C:/tools/jadx-headless-mcp-<version>-all.jar
+```
+
+之后让 AI 调用 `load_apk` 加载你想分析的 APK。要切换到另一个 APK 时直接再调 `load_apk`，或先 `unload_apk` 释放内存 —— **全程不用改配置**。
+
+### 或手改配置文件
+
+注册一个 entry 即可，运行时按需切换 APK：
 
 ```json
 {
@@ -94,9 +101,20 @@
 }
 ```
 
-之后让 AI 调用 `load_apk` 加载你想分析的 APK。要切换到另一个 APK 时直接再调 `load_apk`，或先 `unload_apk` 释放内存。
+要指向可移植 fat jar：
 
-如果你只分析单个 APK 且希望启动后立即可用：
+```json
+{
+  "mcpServers": {
+    "jadx-headless": {
+      "command": "java",
+      "args": ["-jar", "C:/tools/jadx-headless-mcp-<version>-all.jar"]
+    }
+  }
+}
+```
+
+如果你只分析单个 APK 且希望启动后立即可用，用 `args` 附上 APK 路径：
 
 ```json
 {
@@ -108,6 +126,8 @@
   }
 }
 ```
+
+> **注意：** `java -jar` 会跳过启动脚本里烘焙的默认 JVM 参数（如 `-XX:MaxRAMPercentage=60`）。stdout 两种方式都干净 —— slf4j-simple 日志走 stderr，`Main.kt` 也把 `System.out` 重定向到了 stderr —— 但如果要限制内存，得自己通过 `JAVA_OPTS` / `-XX` 传。installDist 启动脚本则保留这些默认值。
 
 ## 架构
 

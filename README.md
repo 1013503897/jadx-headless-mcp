@@ -4,17 +4,6 @@
 
 Headless MCP server for Android APK static analysis, built directly on `jadx-core`. No JADX GUI required, no Python adapter, no plugin to install — just one JVM process speaking MCP over stdio.
 
-## Why
-
-The existing JADX MCP servers ([`zinja-coder/jadx-mcp-server`](https://github.com/zinja-coder/jadx-mcp-server), [`mobilehackinglab/jadx-mcp-plugin`](https://github.com/mobilehackinglab/jadx-mcp-plugin)) all require `jadx-gui` to be running with a plugin loaded. That's awkward for:
-
-- batch APK analysis pipelines
-- CI / Docker / server deployments without a display
-- running multiple instances in parallel (GUI baseline is 300–500 MB each)
-- low-latency tool calls where the Python ↔ HTTP ↔ JVM hop adds up
-
-This project loads APKs through the `jadx-core` library directly and exposes 26 tools as a single MCP stdio server.
-
 ## Tools
 
 ### Session management
@@ -60,12 +49,14 @@ Requires JDK 17+.
 
 Output: `build/install/jadx-headless-mcp/bin/jadx-headless-mcp` (and `.bat` on Windows).
 
-For a single fat jar:
+For a single portable fat jar:
 
 ```bash
 ./gradlew shadowJar
 # build/libs/jadx-headless-mcp-<version>-all.jar
 ```
+
+> **No build needed?** Prebuilt artifacts (fat jar + distribution zip) are attached to every [GitHub Release](../../releases) — download one and point your MCP config at it directly.
 
 ## Run
 
@@ -87,7 +78,23 @@ The server speaks MCP over stdio. Logs go to stderr.
 
 ## Claude Code MCP configuration
 
-Register one entry, swap APKs at runtime — no config edit needed:
+### Quickest: register with the CLI
+
+One command, no JSON editing. `-s user` writes to the global `~/.claude.json`; the default `local` scope only applies to the current project:
+
+```bash
+# installDist launcher
+claude mcp add jadx-headless -s user -- C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat
+
+# ...or the portable fat jar (single file; needs java on PATH)
+claude mcp add jadx-headless -s user -- java -jar C:/tools/jadx-headless-mcp-<version>-all.jar
+```
+
+Then ask the AI to call `load_apk` with the path you want to analyze. Use `unload_apk` to free memory or switch to a different one — no config edit needed.
+
+### Or edit the config by hand
+
+Register one entry, swap APKs at runtime:
 
 ```json
 {
@@ -99,9 +106,20 @@ Register one entry, swap APKs at runtime — no config edit needed:
 }
 ```
 
-Then ask the AI to call `load_apk` with the path you want to analyze. Use `unload_apk` to free memory or switch to a different one.
+To point at the portable fat jar instead:
 
-If you only ever analyze a single APK and want it ready immediately:
+```json
+{
+  "mcpServers": {
+    "jadx-headless": {
+      "command": "java",
+      "args": ["-jar", "C:/tools/jadx-headless-mcp-<version>-all.jar"]
+    }
+  }
+}
+```
+
+If you only ever analyze a single APK and want it ready immediately, append the APK path via `args`:
 
 ```json
 {
@@ -113,6 +131,8 @@ If you only ever analyze a single APK and want it ready immediately:
   }
 }
 ```
+
+> **Note:** `java -jar` skips the launcher's default JVM args (e.g. `-XX:MaxRAMPercentage=60`). stdout stays clean either way — slf4j-simple logs to stderr and `Main.kt` redirects `System.out` to stderr — but if you need a memory ceiling, pass it yourself via `JAVA_OPTS` / `-XX`. The installDist launcher keeps those defaults.
 
 ## Architecture
 
