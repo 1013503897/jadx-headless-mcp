@@ -4,6 +4,14 @@
 
 直接基于 `jadx-core` 构建的 headless MCP 服务器，用于 Android APK 静态分析。无需 JADX GUI、无需 Python 适配器、无需安装插件 —— 单个 JVM 进程通过 stdio 跑 MCP 协议。
 
+## 为什么做这个
+
+jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手点的 GUI。
+
+让有能力的 LLM 直接调 `jadx-core`，GUI 那层就没了存在的理由。模型走同一棵类树、解同样的 xref、读同样的源码，全程 headless、可脚本化。模型越来越强，Java 层的逆向越来越能由它端到端推进，不再靠逆向工程师手动往前。
+
+于是 MCP 丢掉 GUI，把 `jadx-core` 以约 26 个接口经 stdio 暴露。
+
 ## 工具列表
 
 ### 会话管理
