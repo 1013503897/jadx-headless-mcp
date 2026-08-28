@@ -4,6 +4,14 @@
 
 Headless MCP server for Android APK static analysis, built directly on `jadx-core`. No JADX GUI required, no Python adapter, no plugin to install — just one JVM process speaking MCP over stdio.
 
+## Why
+
+jadx is two parts: the `jadx-core` decompiler engine, and a GUI wrapped around it for a human to click through by hand.
+
+Give a capable LLM direct access to `jadx-core` and the GUI loses its reason to exist. The model walks the same class tree, resolves the same xrefs, reads the same source — headless and scriptable. As models get stronger, Java-layer reverse engineering increasingly runs end to end from the model, without a reverse engineer driving it by hand.
+
+So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio.
+
 ## Tools
 
 ### Session management
