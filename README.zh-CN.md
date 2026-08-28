@@ -71,9 +71,13 @@
 
 服务器通过 stdio 跑 MCP 协议。日志全部走 stderr。
 
-## Claude Code MCP 配置
+## MCP 客户端配置
 
-### 最快：用 CLI 注册
+`jadx-headless` 是标准 stdio MCP 服务器，任何支持 MCP 的客户端都能驱动它：Claude Code、Claude Desktop、Cursor、Windsurf、Cline、Roo Code、VS Code / Copilot、LM Studio、Zed、Codex、Gemini CLI 等。Claude Code 接入最省事；其余客户端加一小段配置即可，见 [其它 MCP 客户端](#其它-mcp-客户端)。
+
+### Claude Code
+
+#### 最快：用 CLI 注册
 
 一行命令，无需手改 JSON。`-s user` 写进全局 `~/.claude.json`；默认的 `local` scope 只对当前项目生效：
 
@@ -87,7 +91,7 @@ claude mcp add jadx-headless -s user -- java -jar C:/tools/jadx-headless-mcp-<ve
 
 之后让 AI 调用 `load_apk` 加载你想分析的 APK。要切换到另一个 APK 时直接再调 `load_apk`，或先 `unload_apk` 释放内存 —— **全程不用改配置**。
 
-### 或手改配置文件
+#### 或手改配置文件
 
 注册一个 entry 即可，运行时按需切换 APK：
 
@@ -128,6 +132,45 @@ claude mcp add jadx-headless -s user -- java -jar C:/tools/jadx-headless-mcp-<ve
 ```
 
 > **注意：** `java -jar` 会跳过启动脚本里烘焙的默认 JVM 参数（如 `-XX:MaxRAMPercentage=60`）。stdout 两种方式都干净 —— slf4j-simple 日志走 stderr，`Main.kt` 也把 `System.out` 重定向到了 stderr —— 但如果要限制内存，得自己通过 `JAVA_OPTS` / `-XX` 传。installDist 启动脚本则保留这些默认值。
+
+### 其它 MCP 客户端
+
+把客户端指向同一个启动脚本（或用 `java -jar` 跑 fat jar）即可，各家只是外层配置格式不同。任何客户端都只需两样：`command` 填启动脚本（或 `java`），用 fat jar 时 `args` 填 `["-jar", "<path>-all.jar"]`。`--apk` / `--max-source-bytes` 和 `load_apk` / `unload_apk` 工具在哪个客户端下行为都一致。
+
+**`mcpServers` JSON**：事实标准，Claude Desktop、Cursor、Windsurf、Cline、Roo Code、LM Studio、Gemini CLI 等大多数客户端都吃这套：
+
+```json
+{
+  "mcpServers": {
+    "jadx-headless": {
+      "command": "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+    }
+  }
+}
+```
+
+区别只在放进哪个文件，比如 Claude Desktop 的 `claude_desktop_config.json`、Cursor 的 `.cursor/mcp.json`、Windsurf 的 `~/.codeium/windsurf/mcp_config.json`。确切路径查各客户端的 MCP 文档。
+
+**VS Code / GitHub Copilot** 用的是 `servers` + `type`（不是 `mcpServers`），写在 `.vscode/mcp.json`：
+
+```json
+{
+  "servers": {
+    "jadx-headless": {
+      "type": "stdio",
+      "command": "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+    }
+  }
+}
+```
+
+**TOML 系 CLI**（Codex、Grok 等）用 `mcp_servers` 表：
+
+```toml
+[mcp_servers.jadx-headless]
+command = "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+args = []
+```
 
 ## 架构
 
