@@ -76,9 +76,13 @@ Or eager-load on startup:
 
 The server speaks MCP over stdio. Logs go to stderr.
 
-## Claude Code MCP configuration
+## MCP client configuration
 
-### Quickest: register with the CLI
+`jadx-headless` is a standard stdio MCP server, so any MCP-capable client can drive it — Claude Code, Claude Desktop, Cursor, Windsurf, Cline, Roo Code, VS Code / Copilot, LM Studio, Zed, Codex, Gemini CLI, and others. Claude Code has the smoothest path; the rest take one small config entry — see [Other MCP clients](#other-mcp-clients).
+
+### Claude Code
+
+#### Quickest: register with the CLI
 
 One command, no JSON editing. `-s user` writes to the global `~/.claude.json`; the default `local` scope only applies to the current project:
 
@@ -92,7 +96,7 @@ claude mcp add jadx-headless -s user -- java -jar C:/tools/jadx-headless-mcp-<ve
 
 Then ask the AI to call `load_apk` with the path you want to analyze. Use `unload_apk` to free memory or switch to a different one — no config edit needed.
 
-### Or edit the config by hand
+#### Or edit the config by hand
 
 Register one entry, swap APKs at runtime:
 
@@ -133,6 +137,45 @@ If you only ever analyze a single APK and want it ready immediately, append the 
 ```
 
 > **Note:** `java -jar` skips the launcher's default JVM args (e.g. `-XX:MaxRAMPercentage=60`). stdout stays clean either way — slf4j-simple logs to stderr and `Main.kt` redirects `System.out` to stderr — but if you need a memory ceiling, pass it yourself via `JAVA_OPTS` / `-XX`. The installDist launcher keeps those defaults.
+
+### Other MCP clients
+
+Point the client at the same launcher (or `java -jar` the fat jar); only the surrounding config format differs. In every case `command` is the launcher (or `java`), and for the fat jar `args` is `["-jar", "<path-to>-all.jar"]`. `--apk` / `--max-source-bytes` and the `load_apk` / `unload_apk` tools behave identically no matter which client drives it.
+
+**`mcpServers` JSON** — the de-facto standard, accepted by Claude Desktop, Cursor, Windsurf, Cline, Roo Code, LM Studio, Gemini CLI, and most others:
+
+```json
+{
+  "mcpServers": {
+    "jadx-headless": {
+      "command": "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+    }
+  }
+}
+```
+
+Only the file it goes in differs — e.g. Claude Desktop `claude_desktop_config.json`, Cursor `.cursor/mcp.json`, Windsurf `~/.codeium/windsurf/mcp_config.json`. Check your client's MCP docs for the exact path.
+
+**VS Code / GitHub Copilot** uses `servers` + `type` (not `mcpServers`), in `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "jadx-headless": {
+      "type": "stdio",
+      "command": "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+    }
+  }
+}
+```
+
+**TOML-based CLIs** (Codex, Grok, …) use an `mcp_servers` table:
+
+```toml
+[mcp_servers.jadx-headless]
+command = "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
+args = []
+```
 
 ## Architecture
 

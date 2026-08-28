@@ -122,7 +122,7 @@ fun main(args: Array<String>) {
     })
 
     val server = Server(
-        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.5.0"),
+        serverInfo = Implementation(name = "jadx-headless-mcp", version = "0.5.1"),
         options = ServerOptions(
             capabilities = ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = null))
         )
