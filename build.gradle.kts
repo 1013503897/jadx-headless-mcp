@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.atxx"
-version = "0.5.1"
+version = "0.6.0"
 
 repositories {
     mavenCentral()
@@ -15,6 +15,7 @@ repositories {
 val jadxVersion = "1.5.6"
 val mcpKotlinSdkVersion = "0.15.0"
 val slf4jVersion = "2.0.18"
+val junitVersion = "5.11.3"
 
 dependencies {
     implementation("io.github.skylot:jadx-core:$jadxVersion")
@@ -32,10 +33,42 @@ dependencies {
     implementation("org.slf4j:slf4j-simple:$slf4jVersion")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+
+    testImplementation(kotlin("test"))
+    testImplementation("org.junit.jupiter:junit-jupiter:$junitVersion")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+// Single source of truth for the version string: generate a BuildInfo.kt from the Gradle
+// `version` above so Main.kt no longer hard-codes it (previously two places to keep in sync).
+val generateBuildInfo by tasks.registering {
+    val outDir = layout.buildDirectory.dir("generated/buildinfo/kotlin")
+    val ver = version.toString()
+    inputs.property("version", ver)
+    outputs.dir(outDir)
+    doLast {
+        val f = outDir.get().file("com/atxx/jhmcp/BuildInfo.kt").asFile
+        f.parentFile.mkdirs()
+        f.writeText(
+            "package com.atxx.jhmcp\n\n" +
+                "/** Generated from the Gradle `version` — do not edit by hand. */\n" +
+                "internal object BuildInfo {\n" +
+                "    const val VERSION = \"$ver\"\n" +
+                "}\n"
+        )
+    }
 }
 
 kotlin {
     jvmToolchain(17)
+    sourceSets.named("main") {
+        kotlin.srcDir(generateBuildInfo)
+    }
+}
+
+tasks.test {
+    useJUnitPlatform()
+    testLogging { events("passed", "skipped", "failed") }
 }
 
 application {

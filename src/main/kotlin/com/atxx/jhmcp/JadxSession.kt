@@ -14,7 +14,9 @@ import java.io.File
 import java.util.Collections
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.zip.ZipFile
@@ -34,13 +36,28 @@ class JadxSession private constructor(
 ) : Closeable {
 
     private val log = LoggerFactory.getLogger(JadxSession::class.java)
-    // One worker: jadx class decompilation is not assumed re-entrant across threads on one instance.
-    private val decompilePool = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "jhmcp-decompile").apply { isDaemon = true }
-    }
+
+    // One worker: jadx class decompilation is not assumed re-entrant across threads on a single
+    // JadxDecompiler instance, so all materialization is serialized through one thread. The pool is
+    // REBUILDABLE: jadx's control-flow analysis is a tight CPU loop that may not honor interruption,
+    // so on a decompile timeout we retire the stuck pool (its daemon worker is abandoned) and spin up
+    // a fresh one — otherwise one pathological class would wedge every later request behind a dead
+    // worker, turning the whole session into a string of timeouts.
+    private val poolLock = Any()
+
+    @Volatile
+    private var decompilePool: ExecutorService = newDecompilePool()
+
+    private fun newDecompilePool(): ExecutorService =
+        Executors.newSingleThreadExecutor { r ->
+            Thread(r, "jhmcp-decompile").apply { isDaemon = true }
+        }
 
     val classes: List<JavaClass> by lazy { decompiler.classes }
     val resources: List<ResourceFile> by lazy { decompiler.resources }
+
+    /** Cached top-level class FQNs so list_classes / main-app filtering doesn't re-map every call. */
+    val classFqns: List<String> by lazy { classes.map { it.fullName } }
 
     /**
      * Every class INCLUDING nested/inner ones. jadx's `decompiler.classes` returns only top-level
@@ -76,8 +93,8 @@ class JadxSession private constructor(
     private val classByCanon: Map<String, JavaClass> by lazy {
         val map = HashMap<String, JavaClass>(allClasses.size * 2)
         for (cls in allClasses) {
-            map[canon(cls.fullName)] = cls
-            map.putIfAbsent(canon(cls.rawName), cls)
+            map[canonicalizeClassName(cls.fullName)] = cls
+            map.putIfAbsent(canonicalizeClassName(cls.rawName), cls)
         }
         map
     }
@@ -96,9 +113,6 @@ class JadxSession private constructor(
     /** Exact match on the dotted FQN only (legacy behaviour). Prefer [resolveClass]. */
     fun findClass(fqn: String): JavaClass? = classByFqn[fqn]
 
-    /** Unify nested-class separators so `$` and `.` forms collapse to one key. */
-    private fun canon(s: String): String = s.replace('$', '.')
-
     data class ClassResolution(val cls: JavaClass?, val candidates: List<String>)
 
     /**
@@ -113,11 +127,11 @@ class JadxSession private constructor(
         val q = query.trim()
         classByFqn[q]?.let { return ClassResolution(it, emptyList()) }
         classByRawName[q]?.let { return ClassResolution(it, emptyList()) }
-        val cq = canon(q).trim('.')
+        val cq = canonicalizeClassName(q).trim('.')
         classByCanon[cq]?.let { return ClassResolution(it, emptyList()) }
         // Tier 1: precise suffix on the whole (canonical) query.
         val tier1 = allClasses.asSequence()
-            .filter { val cf = canon(it.fullName); cf == cq || cf.endsWith(".$cq") }
+            .filter { val cf = canonicalizeClassName(it.fullName); cf == cq || cf.endsWith(".$cq") }
             .distinctBy { it.fullName }
             .take(50)
             .toList()
@@ -126,7 +140,7 @@ class JadxSession private constructor(
         // Tier 2: bare simple-name match (broad) — only auto-pick when unique.
         val lastSeg = cq.substringAfterLast('.')
         val tier2 = allClasses.asSequence()
-            .filter { canon(it.fullName).substringAfterLast('.') == lastSeg }
+            .filter { canonicalizeClassName(it.fullName).substringAfterLast('.') == lastSeg }
             .distinctBy { it.fullName }
             .take(50)
             .toList()
@@ -184,7 +198,7 @@ class JadxSession private constructor(
         // Default cap: high when only metadata scopes (cheap); much lower for CODE without package.
         val effectiveMaxScan = when {
             maxScan > 0 -> maxScan
-            !codeScope -> classes.size
+            !codeScope -> allClasses.size
             codeScanCap > 0 -> codeScanCap
             pkg != null -> 20_000
             else -> 5_000
@@ -193,7 +207,9 @@ class JadxSession private constructor(
         val out = ArrayList<ClassHit>(needed.coerceAtLeast(16))
         var scanned = 0
         var stoppedEarly = false
-        for (cls in classes) {
+        // Iterate allClasses (incl. inner/$Companion) so METHOD/FIELD/CLASS scopes match nested
+        // members — consistent with search_method_by_name. CODE stays top-level-only (below).
+        for (cls in allClasses) {
             if (pkg != null && !(cls.fullName == pkg || cls.fullName.startsWith("$pkg."))) continue
             if (scanned >= effectiveMaxScan) { stoppedEarly = true; break }
             scanned++
@@ -208,7 +224,9 @@ class JadxSession private constructor(
             if (SearchScope.FIELD in scopes && cls.fields.any { it.name.lowercase().contains(kw) }) {
                 matched += SearchScope.FIELD
             }
-            if (codeScope) {
+            // CODE only on top-level classes: jadx inlines inner-class source into the outer class's
+            // `code`, so decompiling inners too would re-scan the same text and double-count.
+            if (codeScope && runCatching { cls.declaringClass == null }.getOrDefault(true)) {
                 // Per-class budget: never let one class hang the whole scan.
                 val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(20_000L)) {
                     cls.code.orEmpty()
@@ -271,14 +289,14 @@ class JadxSession private constructor(
         val text = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "source", err) }
-        return truncate(text, maxBytes)
+        return truncateToBytes(text, maxBytes)
     }
 
     fun getClassSmali(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
         val text = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "smali", err) }
-        return truncate(text, maxBytes)
+        return truncateToBytes(text, maxBytes)
     }
 
     /** Decompile a single method body with the same hard timeout. */
@@ -318,9 +336,9 @@ class JadxSession private constructor(
             val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
                 cls.smali.orEmpty()
             }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "smali", err), "smali", true, markers) }
-            return SmartCode(truncate(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
+            return SmartCode(truncateToBytes(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
         }
-        return SmartCode(truncate(java, maxBytes), "java", false, markers)
+        return SmartCode(truncateToBytes(java, maxBytes), "java", false, markers)
     }
 
     /**
@@ -336,11 +354,11 @@ class JadxSession private constructor(
                 val ms = getMethodSmali(owner, method.name)
                 if (ms.found) {
                     val body = ms.blocks.joinToString("\n\n")
-                    return SmartCode(truncate(smaliFallbackHeader(method.fullName, markers) + body, maxBytes), "smali", true, markers)
+                    return SmartCode(truncateToBytes(smaliFallbackHeader(method.fullName, markers) + body, maxBytes), "smali", true, markers)
                 }
             }
         }
-        return SmartCode(truncate(java, maxBytes), "java", false, markers)
+        return SmartCode(truncateToBytes(java, maxBytes), "java", false, markers)
     }
 
     private fun smaliFallbackHeader(name: String, markers: List<String>): String = buildString {
@@ -351,29 +369,8 @@ class JadxSession private constructor(
         appendLine()
     }
 
-    /** Substrings that reliably indicate jadx could NOT produce a usable Java body for a method. */
-    private val STRONG_FAILURE_MARKERS = listOf(
-        "Code decompiled incorrectly, please refer to instructions dump",
-        "Method not decompiled",
-        "Method code generation error",
-        "Can't load method instructions",
-        "Method dump skipped, instruction units count",
-    )
-
-    /** Softer signal — reported but does not, on its own, force a fallback (jadx often still emits usable code). */
-    private val SOFT_FAILURE_MARKERS = listOf(
-        "unreachable blocks",
-        "Failed to decompile",
-    )
-
-    /** Return the failure markers present in [code] (strong markers first). Empty = clean decompile. */
-    fun detectDecompileFailure(code: String): List<String> {
-        if (code.isEmpty()) return emptyList()
-        val out = ArrayList<String>(2)
-        for (m in STRONG_FAILURE_MARKERS) if (code.contains(m, ignoreCase = true)) out += m
-        for (m in SOFT_FAILURE_MARKERS) if (code.contains(m, ignoreCase = true)) out += m
-        return out
-    }
+    // Failure-marker detection now lives in DecompileFailure.kt (STRONG_FAILURE_MARKERS /
+    // detectDecompileFailure) so it is unit-testable without an APK.
 
     // ── Method-level smali extraction ───────────────────────────────────────────
 
@@ -407,40 +404,8 @@ class JadxSession private constructor(
         return Triple(smali.substring(from, to), total, to)
     }
 
-    private val METHOD_DIRECTIVE = Regex("""^\s*\.method\b(.*)$""")
-
-    /** Extract `.method`…`.end method` blocks whose method name equals [methodName]. */
-    private fun extractMethodBlocks(smali: String, methodName: String): List<String> {
-        val out = ArrayList<String>(2)
-        val lines = smali.split('\n')
-        var i = 0
-        while (i < lines.size) {
-            val line = lines[i]
-            val m = METHOD_DIRECTIVE.find(line)
-            if (m != null) {
-                val name = parseSmaliMethodName(m.groupValues[1])
-                val start = i
-                var j = i + 1
-                while (j < lines.size && !lines[j].trimStart().startsWith(".end method")) j++
-                if (name == methodName) {
-                    val end = j.coerceAtMost(lines.size - 1)
-                    out += lines.subList(start, (end + 1).coerceAtMost(lines.size)).joinToString("\n").trimEnd()
-                }
-                i = j + 1
-            } else {
-                i++
-            }
-        }
-        return out
-    }
-
-    /** From the text after `.method` (e.g. `public static foo(Ljava/lang/String;)V`) pull the method name. */
-    private fun parseSmaliMethodName(afterDirective: String): String {
-        val paren = afterDirective.indexOf('(')
-        val head = if (paren >= 0) afterDirective.substring(0, paren) else afterDirective
-        // name is the last whitespace-delimited token before '('
-        return head.trim().substringAfterLast(' ').substringAfterLast('\t').trim()
-    }
+    // Smali block slicing (extractMethodBlocks / parseSmaliMethodName) now lives in SmaliSlicing.kt
+    // so it is unit-testable without an APK.
 
     /**
      * Run [block] on the decompile worker with a wall-clock [timeoutMs] budget.
@@ -454,9 +419,13 @@ class JadxSession private constructor(
         block: () -> T,
     ): Result<T> {
         val started = System.currentTimeMillis()
-        val future = decompilePool.submit(Callable {
-            block()
-        })
+        val pool = decompilePool
+        val future = try {
+            pool.submit(Callable { block() })
+        } catch (re: RejectedExecutionException) {
+            // Pool was retired concurrently (a sibling call timed out and rebuilt it). Transient.
+            return Result.failure(re)
+        }
         return try {
             val value = future.get(timeoutMs, TimeUnit.MILLISECONDS)
             val elapsed = System.currentTimeMillis() - started
@@ -466,6 +435,14 @@ class JadxSession private constructor(
             Result.success(value)
         } catch (te: TimeoutException) {
             future.cancel(true)
+            // The worker is still running the (likely uninterruptible) decompile. Retire this pool so
+            // its abandoned daemon worker stops blocking the queue, and hand later calls a fresh one.
+            synchronized(poolLock) {
+                if (decompilePool === pool) {
+                    pool.shutdownNow()
+                    decompilePool = newDecompilePool()
+                }
+            }
             val msg = "decompile $kind timed out after ${timeoutMs}ms for $classFqn " +
                 "(max_bytes only truncates AFTER jadx finishes — use get_class_summary / get_method_by_name)"
             System.err.println("[jhmcp] $msg")
@@ -590,13 +567,6 @@ class JadxSession private constructor(
         } ?: return null
         val container = runCatching { res.loadContent() }.getOrNull() ?: return null
         return if (container.dataType == ResContainer.DataType.TEXT) container.text.codeStr else null
-    }
-
-    private fun truncate(s: String?, maxBytes: Int): String {
-        val text = s ?: return ""
-        if (text.length <= maxBytes) return text
-        return text.substring(0, maxBytes) +
-            "\n\n... [truncated: source exceeds $maxBytes bytes, total ${text.length} bytes]"
     }
 
     private fun shortType(s: String): String {
