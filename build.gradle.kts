@@ -76,4 +76,12 @@ tasks.register<JavaExec>("bench") {
 tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
     archiveClassifier.set("all")
     mergeServiceFiles()
+    // ShadowJar defaults to DuplicatesStrategy.EXCLUDE, which silently drops the duplicate
+    // META-INF/services/jadx.api.plugins.JadxPlugin files from jadx-dex-input, jadx-java-input,
+    // jadx-java-convert, jadx-smali-input, jadx-raung-input and jadx-xapk-input BEFORE
+    // mergeServiceFiles() can merge them. The released fat jar then registers only
+    // KotlinMetadataPlugin, so no dex/java/smali input plugin is loaded at runtime: every APK
+    // resolves to just the resources-derived R class (1 class) and bare dex files to 0 classes.
+    // INCLUDE routes every copy into the ServiceFileTransformer, which concatenates the entries.
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
 }
