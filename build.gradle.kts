@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.atxx"
-version = "0.6.0"
+version = "0.7.0"
 
 repositories {
     mavenCentral()
@@ -14,6 +14,8 @@ repositories {
 
 val jadxVersion = "1.5.6"
 val mcpKotlinSdkVersion = "0.15.0"
+// Must match the Ktor version the MCP SDK is built against (see kotlin-sdk-server .module metadata).
+val ktorVersion = "3.5.1"
 val slf4jVersion = "2.0.18"
 val junitVersion = "5.11.3"
 
@@ -28,6 +30,12 @@ dependencies {
     implementation("io.github.skylot:jadx-kotlin-metadata:$jadxVersion")
 
     implementation("io.modelcontextprotocol:kotlin-sdk:$mcpKotlinSdkVersion")
+
+    // Ktor engine for the Streamable-HTTP transport (--transport http). The MCP SDK provides the
+    // mcpStreamableHttp() route and auto-installs SSE + ContentNegotiation, but needs a server
+    // engine to actually listen; CIO is the lightweight pure-Kotlin engine.
+    implementation("io.ktor:ktor-server-core:$ktorVersion")
+    implementation("io.ktor:ktor-server-cio:$ktorVersion")
 
     implementation("org.slf4j:slf4j-api:$slf4jVersion")
     implementation("org.slf4j:slf4j-simple:$slf4jVersion")
