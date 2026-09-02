@@ -185,12 +185,43 @@ command = "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
 args = []
 ```
 
+## Remote mode (`--transport http`)
+
+By default the server speaks stdio, so the MCP client spawns it as a local child process — client and jadx live on the same machine. To split them (client on machine B, jadx **and the APK** on machine A), run the server with the **Streamable HTTP** transport and point a remote MCP client at the URL:
+
+```bash
+# on machine A (where jadx runs and the APK lives)
+./bin/jadx-headless-mcp --transport http --host 0.0.0.0 --port 8080 --allowed-host a.example.com
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--transport <stdio\|http>` | `stdio` | serve Streamable HTTP instead of stdio |
+| `--host <addr>` | `127.0.0.1` | bind address; use `0.0.0.0` to accept connections from other machines |
+| `--port <n>` | `8080` | listen port |
+| `--path <p>` | `/mcp` | endpoint path (serves POST/GET/DELETE) |
+| `--allowed-host <h>` | — | extra `Host` header value accepted by the DNS-rebinding check (repeatable). Pass the hostname/IP clients use to reach machine A |
+| `--no-dns-rebinding-protection` | off | disable `Host`/`Origin` validation (trusted networks / behind a reverse proxy only) |
+
+The endpoint is `http://<host>:<port><path>` (default `http://127.0.0.1:8080/mcp`). Point any Streamable-HTTP-capable MCP client at it — e.g. Claude Code:
+
+```bash
+claude mcp add --transport http jadx-headless http://a.example.com:8080/mcp
+```
+
+**The APK always lives on the jadx host.** `load_apk` resolves its `path` with `File(path)` on the machine running the server (A) — a remote client only sends a path string that must be valid on A. Copy the APK to A first, then call `load_apk` with the A-side path. It's still one APK per process; multiple HTTP sessions share the single loaded APK.
+
+**Security:**
+
+- **DNS-rebinding protection is on by default** and only allows loopback `Host` headers, so a remote client reaching `a.example.com` is rejected with `403` unless you add `--allowed-host a.example.com` (or disable the check). This deliberately stops a malicious web page from driving your server.
+- The endpoint has **no authentication**. Prefer binding to `127.0.0.1` and reaching it over an SSH tunnel, or put it behind a reverse proxy / VPN that adds auth. Don't expose `0.0.0.0` on an untrusted network.
+
 ## Architecture
 
 ```
-Claude Code  ──stdio JSON-RPC──>  jadx-headless-mcp (JVM)
+Claude Code  ──stdio | Streamable-HTTP JSON-RPC──>  jadx-headless-mcp (JVM)
                                           │
-                                          ├── MCP Kotlin SDK (stdio server)
+                                          ├── MCP Kotlin SDK (stdio / Ktor CIO HTTP server)
                                           │
                                           └── SessionHolder
                                                  │  (Mutex-serialized load/unload)

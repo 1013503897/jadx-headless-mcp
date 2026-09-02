@@ -180,12 +180,43 @@ command = "C:/tools/jadx-headless-mcp/bin/jadx-headless-mcp.bat"
 args = []
 ```
 
+## 远程模式（`--transport http`）
+
+默认走 stdio，客户端会把服务器当子进程本地拉起 —— 客户端和 jadx 在同一台机器。要把两者拆开（客户端在 B 机、jadx **和 APK** 在 A 机），用 **Streamable HTTP** 传输启动，再让远程 MCP 客户端连这个 URL：
+
+```bash
+# 在 A 机（跑 jadx、APK 也在这台）
+./bin/jadx-headless-mcp --transport http --host 0.0.0.0 --port 8080 --allowed-host a.example.com
+```
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--transport <stdio\|http>` | `stdio` | 用 Streamable HTTP 代替 stdio |
+| `--host <addr>` | `127.0.0.1` | 监听地址；填 `0.0.0.0` 才能接受其它机器连入 |
+| `--port <n>` | `8080` | 监听端口 |
+| `--path <p>` | `/mcp` | 端点路径（POST/GET/DELETE） |
+| `--allowed-host <h>` | — | DNS-rebinding 校验额外放行的 `Host` 头（可重复）。填客户端访问 A 机用的主机名/IP |
+| `--no-dns-rebinding-protection` | 关 | 关闭 `Host`/`Origin` 校验（仅可信网络 / 反代之后用） |
+
+端点是 `http://<host>:<port><path>`（默认 `http://127.0.0.1:8080/mcp`）。任何支持 Streamable HTTP 的 MCP 客户端都能连，比如 Claude Code：
+
+```bash
+claude mcp add --transport http jadx-headless http://a.example.com:8080/mcp
+```
+
+**APK 永远在跑 jadx 的那台机器上。** `load_apk` 是在服务端（A 机）用 `File(path)` 解析路径的 —— 远程客户端只是发一个路径字符串，这个路径必须在 A 上有效。先把 APK 拷到 A，再用 A 侧路径调 `load_apk`。仍然是「一进程一个 APK」；多个 HTTP 会话共享同一个已加载 APK。
+
+**安全提示：**
+
+- **DNS-rebinding 保护默认开启**，只放行 loopback 的 `Host` 头，所以远程客户端访问 `a.example.com` 会被 `403` 拒绝，除非加 `--allowed-host a.example.com`（或关掉校验）。这是故意的 —— 防止恶意网页驱动你的服务器。
+- 端点**没有鉴权**。优先绑 `127.0.0.1` 再用 SSH 隧道访问，或放到带鉴权的反代 / VPN 之后。别在不可信网络上裸露 `0.0.0.0`。
+
 ## 架构
 
 ```
-Claude Code  ──stdio JSON-RPC──>  jadx-headless-mcp (JVM)
+Claude Code  ──stdio | Streamable-HTTP JSON-RPC──>  jadx-headless-mcp (JVM)
                                           │
-                                          ├── MCP Kotlin SDK (stdio 服务器)
+                                          ├── MCP Kotlin SDK (stdio / Ktor CIO HTTP 服务器)
                                           │
                                           └── SessionHolder
                                                  │  (用 Mutex 串行化 load/unload)

@@ -32,9 +32,9 @@ No test sources exist yet (`src/main/kotlin` only). CI (`.github/workflows/build
 ## Architecture
 
 ```
-stdin/stdout (MCP JSON-RPC)
+stdin/stdout (MCP JSON-RPC)   ── OR ──   Ktor CIO HTTP (Streamable HTTP, --transport http)
         │
-   Main.kt ── registers ~20 tools on a Server, then StdioServerTransport
+   Main.kt ── registers ~26 tools on a Server, then StdioServerTransport | mcpStreamableHttp
         │
    SessionHolder ── Mutex-serialized load() / unload(); holds 0..1 JadxSession
         │
@@ -59,6 +59,8 @@ Three Kotlin files total; keep changes scoped to whichever layer owns the concer
 - **New tools:** `get_method_body`, `get_method_smali`, `get_inner_classes`, `resolve_class`; enhanced: `get_class_source` + `get_method_by_name` (`smali_fallback`), `get_smali_of_class` (`offset` paging with `total_bytes`/`next_offset`). 26 tools total.
 
 > **Resource export moved out (v0.5.0):** `export_apk_resources` / `export_arsc_resources` were removed from here and live in the sibling **`dex-forge`** MCP, so this server stays read-only analysis and the whole APK-repack pipeline (dex + resources) sits in one place. See `../dex-forge`.
+
+> **Remote transport (v0.7.0):** `--transport http` serves the MCP **Streamable HTTP** transport (SDK `mcpStreamableHttp` on a Ktor CIO engine) so a client on another machine can drive the server; stdio stays the default. Flags: `--host` (default `127.0.0.1`), `--port` (8080), `--path` (`/mcp`), `--allowed-host <h>` (repeatable), `--no-dns-rebinding-protection`. `main()` builds the `Server` via a `buildServer()` factory shared by both transports over one `SessionHolder`, so the loaded APK persists across HTTP sessions (still one APK per process). **DNS-rebinding protection is ON by default** (only loopback `Host` allowed) — remote clients need `--allowed-host <their-host>` or they get `403`; no auth, so tunnel/reverse-proxy it. `load_apk` paths always resolve on the server host. Ktor version in `build.gradle.kts` **must match** the SDK's (`kotlin-sdk-server` `.module` → currently `3.5.1`).
 
 > **Rebuild gotcha:** MCP clients keep `com.atxx.jhmcp.MainKt` server processes alive and a supervisor respawns them within ~2 s, so they hold read locks on `build/install/jadx-headless-mcp/lib/*.jar` and `installDist` fails with *"Unable to delete file …"*. Kill only the **server** processes (match command line `*com.atxx.jhmcp.MainKt*`, NOT `*jadx-headless-mcp*` — that also matches the Gradle client and kills your own build) in a fast loop *while* `installDist` runs, then stop the loop so clients respawn on the new jar.
 
