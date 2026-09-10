@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "jadx-headless": {
+      "command": "java",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/Launcher.java",
+        "${CLAUDE_PLUGIN_DATA}",
+        "0.7.0",
+        "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.0/jadx-headless-mcp-0.7.0-all.jar",
+        "PLACEHOLDER_SHA256_SEE_PLUGIN_MD"
+      ]
+    }
+  }
+}

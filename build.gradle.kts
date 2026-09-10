@@ -116,6 +116,11 @@ tasks.register<JavaExec>("bench") {
 
 tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
     archiveClassifier.set("all")
+    // Reproducible output: the plugin (.mcp.json) pins this jar's SHA-256, so re-running the same
+    // release tag on the same JDK must yield a byte-identical jar. Drop entry timestamps and sort
+    // the file order. (Cross-JDK builds still differ; the pinned hash comes from the CI artifact.)
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
     mergeServiceFiles()
     // ShadowJar defaults to DuplicatesStrategy.EXCLUDE, which silently drops the duplicate
     // META-INF/services/jadx.api.plugins.JadxPlugin files from jadx-dex-input, jadx-java-input,

@@ -1,0 +1,21 @@
+{
+  "name": "jadx-headless-mcp",
+  "owner": {
+    "name": "w101",
+    "url": "https://github.com/1013503897"
+  },
+  "description": "jadx-headless: headless jadx MCP for Android APK static analysis.",
+  "plugins": [
+    {
+      "name": "jadx-headless",
+      "source": {
+        "source": "github",
+        "repo": "1013503897/jadx-headless-mcp"
+      },
+      "description": "Decompile, search and xref Android APKs via ~26 MCP tools over stdio (jadx-core, headless).",
+      "category": "reverse-engineering",
+      "keywords": ["android", "apk", "jadx", "decompiler", "reverse-engineering", "static-analysis"],
+      "license": "Apache-2.0"
+    }
+  ]
+}
