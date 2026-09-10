@@ -79,6 +79,20 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 
 服务器通过 stdio 跑 MCP 协议。日志全部走 stderr。
 
+## 作为 Claude Code 插件安装
+
+本仓同时是一个 [Claude Code 插件](https://code.claude.com/docs/en/plugins)，这是 Claude Code 下最省事的
+装法：不用改 JSON、不用手动构建。前提是 **PATH 上有 JDK 17+**；首次启动会下载发布的 fat jar（校验
+SHA-256）并缓存。
+
+```
+/plugin marketplace add 1013503897/jadx-headless-mcp
+/plugin install jadx-headless@jadx-headless-mcp
+```
+
+它打包了 MCP 服务器和 `/jadx-headless:open-apk` skill。工作原理、本地开发（`claude --plugin-dir .`）、
+发版与社区市场提交流程见 [PLUGIN.md](PLUGIN.md)。若你想手动接线（或用其它客户端），用下面的手动配置。
+
 ## MCP 客户端配置
 
 `jadx-headless` 是标准 stdio MCP 服务器，任何支持 MCP 的客户端都能驱动它：Claude Code、Claude Desktop、Cursor、Windsurf、Cline、Roo Code、VS Code / Copilot、LM Studio、Zed、Codex、Gemini CLI 等。Claude Code 接入最省事；其余客户端加一小段配置即可，见 [其它 MCP 客户端](#其它-mcp-客户端)。

@@ -84,6 +84,22 @@ Or eager-load on startup:
 
 The server speaks MCP over stdio. Logs go to stderr.
 
+## Install as a Claude Code plugin
+
+This repo is also a [Claude Code plugin](https://code.claude.com/docs/en/plugins) — the easiest way
+to install for Claude Code, no JSON editing and no manual build. It needs **JDK 17+ on `PATH`**; on
+first start it downloads the released fat jar (SHA-256 verified) and caches it.
+
+```
+/plugin marketplace add 1013503897/jadx-headless-mcp
+/plugin install jadx-headless@jadx-headless-mcp
+```
+
+This bundles the MCP server plus the `/jadx-headless:open-apk` skill. See [PLUGIN.md](PLUGIN.md) for
+how it works, local development (`claude --plugin-dir .`), releasing, and community-marketplace
+submission. If you'd rather wire the server up by hand (or use another client), use the manual
+configuration below.
+
 ## MCP client configuration
 
 `jadx-headless` is a standard stdio MCP server, so any MCP-capable client can drive it — Claude Code, Claude Desktop, Cursor, Windsurf, Cline, Roo Code, VS Code / Copilot, LM Studio, Zed, Codex, Gemini CLI, and others. Claude Code has the smoothest path; the rest take one small config entry — see [Other MCP clients](#other-mcp-clients).

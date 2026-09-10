@@ -36,6 +36,13 @@ jobs:
       - name: Smoke check fat jar
         run: java -jar build/libs/jadx-headless-mcp-*-all.jar --help
 
+      # The plugin (.mcp.json) pins this jar's SHA-256; this prints it (CI log) and publishes it as
+      # a release asset so the maintainer can copy it into .mcp.json. See PLUGIN.md.
+      - name: Compute checksum
+        run: |
+          cd build/libs
+          sha256sum jadx-headless-mcp-*-all.jar | tee jadx-headless-mcp.sha256
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -43,6 +50,7 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             build/libs/jadx-headless-mcp-*-all.jar \
+            build/libs/jadx-headless-mcp.sha256 \
             build/distributions/jadx-headless-mcp-*.zip \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
