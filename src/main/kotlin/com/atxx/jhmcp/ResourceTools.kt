@@ -23,6 +23,11 @@ internal fun Server.registerResourceTools(holder: SessionHolder) {
         )
     ) { req: CallToolRequest ->
         val s = holder.current() ?: return@addTool noApkLoaded()
+        if (s.resourceMode == ResourceMode.NONE) {
+            return@addTool errorResult(
+                "get_strings is unavailable with resources=none. Reload with resources=lite or full."
+            )
+        }
         val filter = req.arguments.strArg("filter")
         val limit = req.arguments.intArg("limit") ?: 500
         val items = collectStringResources(s, filter, limit)
@@ -42,7 +47,7 @@ internal fun Server.registerResourceTools(holder: SessionHolder) {
 
     addTool(
         name = "list_resource_files",
-        description = "List names of all resource files in the APK.",
+        description = "List names of resource files in the APK. With resources=lite this is Manifest + strings XML + arsc; with resources=none only AndroidManifest.xml.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("filter") { put("type", "string"); put("description", "case-insensitive substring filter on file name") }

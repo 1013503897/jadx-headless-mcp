@@ -6,7 +6,7 @@ fun main(args: Array<String>) {
     val timeout = if (args.size > 1) args[1].toLong() else 15_000L
     println("loading $apk timeout=$timeout")
     val t0 = System.currentTimeMillis()
-    val s = JadxSession.open(apk, maxSourceBytes = 50_000, decompileTimeoutMs = timeout)
+    val s = JadxSession.open(apk, SessionConfig(maxSourceBytes = 50_000, decompileTimeoutMs = timeout))
     println("loaded in ${System.currentTimeMillis() - t0}ms classes=${s.classes.size}")
     val fqn = "gcash.module.otp.msisdn.code.OtpCodeViewModel"
     val cls = s.findClass(fqn) ?: error("missing $fqn")

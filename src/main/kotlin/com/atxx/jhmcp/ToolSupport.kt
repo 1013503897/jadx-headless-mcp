@@ -87,7 +87,7 @@ internal fun renderUsage(
     uses: List<jadx.api.JavaNode>,
     limit: Int,
     s: JadxSession,
-    resolveLine: Boolean = true,
+    resolveLine: Boolean = false,
 ): CallToolResult {
     val items = uses.asSequence().take(limit).map { s.describeUsage(it, resolveLine) }.toList()
     return okJson(buildJsonObject {

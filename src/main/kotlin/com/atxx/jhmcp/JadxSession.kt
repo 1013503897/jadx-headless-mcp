@@ -7,6 +7,7 @@ import jadx.api.JavaField
 import jadx.api.JavaMethod
 import jadx.api.JavaNode
 import jadx.api.ResourceFile
+import jadx.api.ResourceType
 import jadx.core.xmlgen.ResContainer
 import org.slf4j.LoggerFactory
 import java.io.Closeable
@@ -24,16 +25,17 @@ import java.util.zip.ZipFile
 class JadxSession private constructor(
     private val decompiler: JadxDecompiler,
     val apkPath: String,
-    val maxSourceBytes: Int,
-    /** Per-process override for the default `code`-scope scan cap. 0 = use built-in tiered defaults. */
-    val codeScanCap: Int = 0,
-    /**
-     * Hard wall-clock budget for a single jadx decompile/smali materialization.
-     * Truncation (max_bytes) only runs *after* jadx finishes — without this timeout a fat
-     * obfuscated class can block the whole MCP process for tens of minutes.
-     */
-    val decompileTimeoutMs: Long = DEFAULT_DECOMPILE_TIMEOUT_MS,
+    val options: SessionConfig,
+    /** Top-level class count as jadx loaded them, before [PackageFilter]. */
+    val rawClassCount: Int,
 ) : Closeable {
+    val maxSourceBytes: Int get() = options.maxSourceBytes
+    val codeScanCap: Int get() = options.codeScanCap
+    val decompileTimeoutMs: Long get() = options.decompileTimeoutMs
+    val resourceMode: ResourceMode get() = options.resourceMode
+    val threads: Int get() = options.resolvedThreads()
+    val codeCacheSize: Int get() = options.codeCacheSize
+    val packageFilter: PackageFilter get() = options.packageFilter
 
     private val log = LoggerFactory.getLogger(JadxSession::class.java)
 
@@ -53,8 +55,32 @@ class JadxSession private constructor(
             Thread(r, "jhmcp-decompile").apply { isDaemon = true }
         }
 
-    val classes: List<JavaClass> by lazy { decompiler.classes }
-    val resources: List<ResourceFile> by lazy { decompiler.resources }
+    private val decompileLru = DecompileLru(options.codeCacheSize)
+
+    /**
+     * Top-level classes visible to tools. When a package filter is active, excluded classes
+     * are `unload()`'d (method IR eligible for GC) and omitted here. jadx still parsed them
+     * during `load()` — see [rawClassCount].
+     */
+    val classes: List<JavaClass> by lazy {
+        val raw = decompiler.classes
+        if (!packageFilter.active) return@lazy raw
+        val kept = ArrayList<JavaClass>(raw.size)
+        for (c in raw) {
+            if (packageFilter.keep(c.fullName, c.rawName)) kept += c
+            else runCatching { c.unload() }
+        }
+        kept
+    }
+
+    val resources: List<ResourceFile> by lazy {
+        val all = decompiler.resources
+        when (resourceMode) {
+            ResourceMode.FULL -> all
+            ResourceMode.LITE -> all.filter { isLiteResource(it) }
+            ResourceMode.NONE -> all.filter { isManifestResource(it) }
+        }
+    }
 
     /** Cached top-level class FQNs so list_classes / main-app filtering doesn't re-map every call. */
     val classFqns: List<String> by lazy { classes.map { it.fullName } }
@@ -231,6 +257,7 @@ class JadxSession private constructor(
                 val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(20_000L)) {
                     cls.code.orEmpty()
                 }.getOrElse { "" }
+                rememberDecompiled(cls)
                 if (code.isNotEmpty()) {
                     val idx = code.indexOf(term, ignoreCase = true)
                     if (idx >= 0) {
@@ -289,6 +316,7 @@ class JadxSession private constructor(
         val text = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "source", err) }
+        rememberDecompiled(cls)
         return truncateToBytes(text, maxBytes)
     }
 
@@ -296,19 +324,22 @@ class JadxSession private constructor(
         val text = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "smali", err) }
+        rememberDecompiled(cls)
         return truncateToBytes(text, maxBytes)
     }
 
     /** Decompile a single method body with the same hard timeout. */
     fun getMethodSource(method: JavaMethod): String {
         val owner = method.declaringClass?.fullName ?: method.fullName
-        return decompileTimed(owner, "method:${method.name}", decompileTimeoutMs) {
+        val text = decompileTimed(owner, "method:${method.name}", decompileTimeoutMs) {
             method.codeStr.orEmpty().ifEmpty {
                 "// method exists but has no decompiled body (native/abstract)"
             }
         }.getOrElse { err ->
-            "// ERROR: decompile timed out or failed for ${method.fullName}: ${err.message}"
+            return "// ERROR: decompile timed out or failed for ${method.fullName}: ${err.message}"
         }
+        method.declaringClass?.let { rememberDecompiled(it) }
+        return text
     }
 
     // ── Decompile-failure detection & seamless smali fallback ────────────────────
@@ -331,11 +362,13 @@ class JadxSession private constructor(
         val java = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "source", err), "java", false, emptyList()) }
+        rememberDecompiled(cls)
         val markers = detectDecompileFailure(java)
         if (smaliFallback && markers.any { it in STRONG_FAILURE_MARKERS }) {
             val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
                 cls.smali.orEmpty()
             }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "smali", err), "smali", true, markers) }
+            rememberDecompiled(cls)
             return SmartCode(truncateToBytes(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
         }
         return SmartCode(truncateToBytes(java, maxBytes), "java", false, markers)
@@ -387,6 +420,7 @@ class JadxSession private constructor(
         }.getOrElse { err ->
             return MethodSmali(methodName, emptyList(), false, "smali generation failed: ${err.message}")
         }
+        rememberDecompiled(cls)
         if (smali.isEmpty()) return MethodSmali(methodName, emptyList(), false, "class has no smali (no code)")
         val blocks = extractMethodBlocks(smali, methodName)
         return MethodSmali(methodName, blocks, blocks.isNotEmpty())
@@ -397,6 +431,7 @@ class JadxSession private constructor(
         val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return Triple(decompileErrorBanner(cls, "smali", err), 0, 0) }
+        rememberDecompiled(cls)
         val total = smali.length
         if (offset >= total) return Triple("", total, total)
         val from = offset.coerceIn(0, total)
@@ -512,7 +547,7 @@ class JadxSession private constructor(
                 "inner_classes" to cls.innerClasses.map { it.fullName },
             )
         }
-        return skeleton.getOrElse { err ->
+        val result = skeleton.getOrElse { err ->
             mapOf(
                 "full_name" to cls.fullName,
                 "name" to cls.name,
@@ -525,14 +560,16 @@ class JadxSession private constructor(
                 "hint" to "summary timed out — class likely control-flow obfuscated; try search_method_by_name / DEX strings",
             )
         }
+        if (result["error"] == null) rememberDecompiled(cls)
+        return result
     }
 
     /**
      * Describe a single xref entry. With [resolveLine] = true, includes the line
      * in the top-level containing class's decompiled source — at the cost of
-     * forcing that class to be decompiled (cached by jadx after first call).
+     * forcing that class to be decompiled (then subject to the decompile LRU).
      */
-    fun describeUsage(node: JavaNode, resolveLine: Boolean = true): Map<String, Any> {
+    fun describeUsage(node: JavaNode, resolveLine: Boolean = false): Map<String, Any> {
         val declaring = runCatching { node.declaringClass?.fullName }.getOrNull().orEmpty()
         val kind = when (node) {
             is JavaClass -> "class"
@@ -543,7 +580,9 @@ class JadxSession private constructor(
         val topCls = runCatching { node.topParentClass }.getOrNull()
         val defPos = runCatching { node.defPos }.getOrNull() ?: 0
         val line = if (resolveLine && topCls != null && defPos > 0) {
-            runCatching { topCls.getSourceLine(defPos) }.getOrNull() ?: 0
+            val n = runCatching { topCls.getSourceLine(defPos) }.getOrNull() ?: 0
+            rememberDecompiled(topCls)
+            n
         } else 0
         val out = mutableMapOf<String, Any>(
             "kind" to kind,
@@ -569,6 +608,10 @@ class JadxSession private constructor(
         return if (container.dataType == ResContainer.DataType.TEXT) container.text.codeStr else null
     }
 
+    private fun rememberDecompiled(cls: JavaClass) {
+        decompileLru.remember(cls)
+    }
+
     private fun shortType(s: String): String {
         // Strip leading package on common types to keep summary readable:
         // "java.lang.String" -> "String", "com.foo.Bar" -> "Bar". Keep arrays/generics intact.
@@ -592,11 +635,8 @@ class JadxSession private constructor(
 
         fun open(
             apkPath: String,
-            maxSourceBytes: Int = 200_000,
-            codeScanCap: Int = 0,
-            decompileTimeoutMs: Long = DEFAULT_DECOMPILE_TIMEOUT_MS,
+            options: SessionConfig = SessionConfig(),
         ): JadxSession {
-            val log = LoggerFactory.getLogger(JadxSession::class.java)
             val file = File(apkPath)
             require(file.exists()) { "APK not found: $apkPath" }
             require(file.isFile) { "Not a regular file: $apkPath" }
@@ -612,28 +652,55 @@ class JadxSession private constructor(
             outDir.mkdirs()
             outDir.deleteOnExit()
 
+            val threads = options.resolvedThreads()
             val args = JadxArgs().apply {
                 inputFiles.add(effectiveFile)
                 setOutDir(outDir)
                 isShowInconsistentCode = true
-                threadsCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+                threadsCount = threads
                 // Suppress JADX's "case insensitive filesystem" rename pass so class names stay
                 // identical to the runtime FQN — Frida users rely on this. Safe because we only
                 // call decompiler.load() and read sources in-memory, never decompiler.save().
                 isFsCaseSensitive = true
+                isSkipFilesSave = true
+                if (options.resourceMode != ResourceMode.FULL) {
+                    isSkipXmlPrettyPrint = true
+                }
             }
 
             val started = System.currentTimeMillis()
-            System.err.println("[jhmcp] loading APK: $apkPath")
+            System.err.println("[jhmcp] loading APK: $apkPath (threads=$threads resources=${options.resourceMode.name.lowercase()})")
             if (effectiveFile !== file) {
                 System.err.println("[jhmcp] XAPK has no manifest.json; extracted base APK: ${effectiveFile.name}")
             }
             val decompiler = JadxDecompiler(args)
             decompiler.load()
             val elapsed = System.currentTimeMillis() - started
-            System.err.println("[jhmcp] loaded in ${elapsed}ms, classes=${decompiler.classes.size}")
+            val rawCount = decompiler.classes.size
+            System.err.println("[jhmcp] loaded in ${elapsed}ms, classes=$rawCount")
+            val filter = options.packageFilter
+            if (filter.active) {
+                System.err.println(
+                    "[jhmcp] package filter include=${filter.include} exclude=${filter.exclude} " +
+                        "(jadx still parsed all $rawCount top-level classes; dropped ones are unloaded)"
+                )
+            }
 
-            return JadxSession(decompiler, apkPath, maxSourceBytes, codeScanCap, decompileTimeoutMs)
+            return JadxSession(decompiler, apkPath, options, rawCount)
+        }
+
+        internal fun isManifestResource(res: ResourceFile): Boolean {
+            val n = res.deobfName.lowercase()
+            if (n.endsWith("androidmanifest.xml") || n == "androidmanifest.xml") return true
+            return runCatching { res.type == ResourceType.MANIFEST }.getOrDefault(false)
+        }
+
+        internal fun isLiteResource(res: ResourceFile): Boolean {
+            if (isManifestResource(res)) return true
+            val n = res.deobfName.lowercase()
+            if (n.endsWith("resources.arsc") || n == "resources") return true
+            if ("/values" in n && "strings" in n && n.endsWith(".xml")) return true
+            return runCatching { res.type == ResourceType.ARSC }.getOrDefault(false)
         }
 
         private fun extractXapkBaseIfNoManifest(xapk: File): File? {
