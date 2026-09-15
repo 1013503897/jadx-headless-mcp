@@ -22,9 +22,7 @@ private enum class TransportMode { STDIO, HTTP }
 
 private data class Config(
     val apkPath: String?,
-    val maxSourceBytes: Int,
-    val codeScanCap: Int,
-    val decompileTimeoutMs: Long,
+    val session: SessionConfig,
     val transport: TransportMode,
     val host: String,
     val port: Int,
@@ -38,6 +36,11 @@ private fun parseArgs(args: Array<String>): Config {
     var maxSourceBytes = 60_000
     var codeScanCap = 0
     var decompileTimeoutMs = JadxSession.DEFAULT_DECOMPILE_TIMEOUT_MS
+    var threads = SessionConfig.defaultLoadThreads()
+    val includePackages = mutableListOf<String>()
+    val excludePackages = mutableListOf<String>()
+    var codeCacheSize = SessionConfig.DEFAULT_CODE_CACHE_SIZE
+    var resourceMode = ResourceMode.FULL
     var transport = TransportMode.STDIO
     var host = "127.0.0.1"
     var port = 8080
@@ -67,6 +70,32 @@ private fun parseArgs(args: Array<String>): Config {
                 require(i + 1 < args.size) { "--decompile-timeout-ms requires a value" }
                 decompileTimeoutMs = args[i + 1].toLong()
                 require(decompileTimeoutMs >= 1_000L) { "--decompile-timeout-ms must be >= 1000" }
+                i += 2
+            }
+            "--threads" -> {
+                require(i + 1 < args.size) { "--threads requires a value" }
+                threads = args[i + 1].toInt()
+                i += 2
+            }
+            "--include-packages" -> {
+                require(i + 1 < args.size) { "--include-packages requires a value" }
+                includePackages += PackageFilter.parseList(args[i + 1])
+                i += 2
+            }
+            "--exclude-packages" -> {
+                require(i + 1 < args.size) { "--exclude-packages requires a value" }
+                excludePackages += PackageFilter.parseList(args[i + 1])
+                i += 2
+            }
+            "--code-cache-size" -> {
+                require(i + 1 < args.size) { "--code-cache-size requires a value" }
+                codeCacheSize = args[i + 1].toInt()
+                require(codeCacheSize >= 0) { "--code-cache-size must be >= 0 (0 = unlimited)" }
+                i += 2
+            }
+            "--resources" -> {
+                require(i + 1 < args.size) { "--resources requires a value (full|lite|none)" }
+                resourceMode = ResourceMode.parse(args[i + 1])
                 i += 2
             }
             "--transport" -> {
@@ -118,8 +147,23 @@ private fun parseArgs(args: Array<String>): Config {
         }
     }
     return Config(
-        apkPath, maxSourceBytes, codeScanCap, decompileTimeoutMs,
-        transport, host, port, path, allowedHosts.toList(), dnsRebindingProtection,
+        apkPath = apkPath,
+        session = SessionConfig(
+            maxSourceBytes = maxSourceBytes,
+            codeScanCap = codeScanCap,
+            decompileTimeoutMs = decompileTimeoutMs,
+            threads = threads,
+            includePackages = includePackages.toList(),
+            excludePackages = excludePackages.toList(),
+            codeCacheSize = codeCacheSize,
+            resourceMode = resourceMode,
+        ),
+        transport = transport,
+        host = host,
+        port = port,
+        path = path,
+        allowedHosts = allowedHosts.toList(),
+        dnsRebindingProtection = dnsRebindingProtection,
     )
 }
 
@@ -157,6 +201,19 @@ Analysis:
   --decompile-timeout-ms <n> hard wall-clock budget per get_class_source / get_smali_of_class /
                             get_method_by_name / code-search class (default 90000). Prevents one
                             fat obfuscated class from blocking the MCP process for hours.
+  --threads <n>             jadx pre-decompile worker count. Default min(CPU, 4) to cap peak RAM.
+                            0 = use every core (legacy). load_apk can override per APK.
+  --include-packages <list> comma-separated package/FQN prefixes to KEEP (e.g. com.gcash,com.mynt).
+                            Repeatable. Applied after jadx load(); dropped ClassNodes are unloaded.
+  --exclude-packages <list> comma-separated package prefixes to DROP (e.g. androidx,kotlin).
+                            Repeatable. Combined with include: must match include AND not exclude.
+  --code-cache-size <n>     max decompiled top-level classes kept in RAM (default 64). Least-recent
+                            is JavaClass.unload()'d. 0 = unlimited (legacy). load_apk can override.
+  --resources <full|lite|none>
+                            full (default): expose every resource file.
+                            lite: tools only see Manifest + values/strings XML + resources.arsc.
+                            none: hide non-manifest resources (get_strings unavailable).
+                            NOTE: jadx 1.5.6 still parses resources.arsc during load() in all modes.
   -h, --help                show this help
 """
 
@@ -168,7 +225,7 @@ fun main(args: Array<String>) {
     System.setOut(System.err)
 
     val cfg = parseArgs(args)
-    val holder = SessionHolder(cfg.maxSourceBytes, cfg.codeScanCap, cfg.decompileTimeoutMs)
+    val holder = SessionHolder(cfg.session)
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { runBlocking { holder.unload() } }
     })

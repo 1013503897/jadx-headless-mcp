@@ -14,7 +14,7 @@ fun main(args: Array<String>) {
 }
 
 fun benchMain(apkPath: String) = runBlocking {
-    val holder = SessionHolder(maxSourceBytes = 200_000)
+    val holder = SessionHolder(SessionConfig(maxSourceBytes = 200_000))
     holder.load(apkPath)
     val s = holder.current()!!
 

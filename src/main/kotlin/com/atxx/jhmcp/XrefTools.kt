@@ -10,17 +10,17 @@ import kotlinx.serialization.json.putJsonObject
 /**
  * Cross-reference tools: get_xrefs_to_class / _method / _field.
  *
- * Each accepts `resolve_line` (default true). Resolving the source line of every usage
+ * Each accepts `resolve_line` (default false). Resolving the source line of every usage
  * force-decompiles that usage's top-level class; on a large fan-out (hundreds of xrefs across
- * hundreds of classes) that is the dominant cost. Pass resolve_line=false to get the reference
- * list cheaply (line reported as 0).
+ * hundreds of classes) that is the dominant cost. Pass resolve_line=true only when you need
+ * source line numbers.
  */
 internal fun Server.registerXrefTools(holder: SessionHolder) {
     val resolveLineProp: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit = {
         putJsonObject("resolve_line") {
             put("type", "boolean")
-            put("description", "Resolve each usage's source line (force-decompiles its class). Default true; set false for a cheap reference list.")
-            put("default", true)
+            put("description", "Resolve each usage's source line (force-decompiles its class). Default false; set true only when you need line numbers.")
+            put("default", false)
         }
     }
 
@@ -39,7 +39,7 @@ internal fun Server.registerXrefTools(holder: SessionHolder) {
         val s = holder.current() ?: return@addTool noApkLoaded()
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val resolveLine = req.arguments.boolArg("resolve_line") ?: true
+        val resolveLine = req.arguments.boolArg("resolve_line") ?: false
         val (cls, err) = s.resolveClassArg(fqn)
         if (cls == null) return@addTool err!!
         renderUsage(cls.fullName, cls.useIn, limit, s, resolveLine)
@@ -62,7 +62,7 @@ internal fun Server.registerXrefTools(holder: SessionHolder) {
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("method_name") ?: return@addTool errorResult("method_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val resolveLine = req.arguments.boolArg("resolve_line") ?: true
+        val resolveLine = req.arguments.boolArg("resolve_line") ?: false
         val m = s.findMethod(fqn, name) ?: return@addTool methodNotFound(s, fqn, name)
         renderUsage(m.fullName, m.useIn, limit, s, resolveLine)
     }
@@ -84,7 +84,7 @@ internal fun Server.registerXrefTools(holder: SessionHolder) {
         val fqn = req.arguments.strArg("class_name") ?: return@addTool errorResult("class_name is required")
         val name = req.arguments.strArg("field_name") ?: return@addTool errorResult("field_name is required")
         val limit = req.arguments.intArg("limit") ?: 200
-        val resolveLine = req.arguments.boolArg("resolve_line") ?: true
+        val resolveLine = req.arguments.boolArg("resolve_line") ?: false
         val (cls, err) = s.resolveClassArg(fqn)
         if (cls == null) return@addTool err!!
         val f = cls.fields.firstOrNull { it.name == name }
