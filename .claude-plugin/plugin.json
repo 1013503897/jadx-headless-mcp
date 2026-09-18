@@ -1,6 +1,6 @@
 {
   "name": "jadx-headless",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Headless jadx MCP server for Android APK static analysis — decompile, search and xref via ~26 tools over stdio (no jadx GUI, no plugin, no Python adapter).",
   "author": {
     "name": "w101",
