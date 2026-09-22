@@ -17,7 +17,7 @@ val mcpKotlinSdkVersion = "0.15.0"
 // Must match the Ktor version the MCP SDK is built against (see kotlin-sdk-server .module metadata).
 val ktorVersion = "3.5.1"
 val slf4jVersion = "2.0.19"
-val junitVersion = "5.11.3"
+val junitVersion = "6.1.3"
 
 dependencies {
     implementation("io.github.skylot:jadx-core:$jadxVersion")
