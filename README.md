@@ -278,6 +278,42 @@ Related but **not** auto-synced (different architecture; manual watch only):
 
 If those projects ship a new tool worth porting, file an issue here.
 
+## Used by
+
+- **[REA](https://github.com/morluto/rea)** (`morluto/rea`) integrates this project as an upstream analysis engine for its static Android APK analysis. REA vendors it as an unmodified, commit-pinned git submodule (`third_party/jadx-headless-mcp`, pinned to `v0.7.1` at commit `5844800`) with **no upstream patches**, and identifies the release JAR it runs by SHA-256. Provenance: REA's [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md) and [`docs/android-analysis.md`](https://github.com/morluto/rea/blob/main/docs/android-analysis.md); the pinned version / commit / digest live in [`src/android/JadxRelease.ts`](https://github.com/morluto/rea/blob/main/src/android/JadxRelease.ts).
+
+Pinning this engine by digest in your own project? The release JAR digests below let you verify a download the same way.
+
+## Release verification (SHA-256)
+
+Every [GitHub Release](../../releases) attaches the portable fat jar `jadx-headless-mcp-<version>-all.jar` (plus a distribution zip, and — since v0.7.1 — a `jadx-headless-mcp.sha256` asset). To pin or verify a download — as the Claude Code plugin's [`.mcp.json`](.mcp.json) does, and as any downstream integrator that locks the JAR by digest needs — check the fat jar's SHA-256 against this table:
+
+| Release | SHA-256 of `jadx-headless-mcp-<version>-all.jar` |
+|---|---|
+| v0.7.2 | `f4597565f1a3410c03e1da4f5e3a508626fc6a02236452bf09bbf0c20cda2131` |
+| v0.7.1 | `6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75` |
+| v0.7.0 | `18438a640d0c98a5afcb93e4a9f47c1491e38173a8d6841f1615886d5433ec07` |
+| v0.6.0 | `7b8dc9187637266ea665be9537e367918e9b69b6633a755d096604590dbdf3e5` |
+| v0.5.1 | `a649431098b0e1af6ffe349cb3d02ef2273302d122db25091801a4294de3c755` |
+| v0.5.0 | `211201ec93825a59e98b43c9b8fd509aa9d8c97f37e03ed0e3166c4fb71f1694` |
+| v0.4.0 | `1ce76f4bab525a7acd609f0549b1a7a673887ea5a2e74a4fbd1e6bc35e075a97` |
+| v0.3.0 | `433fffdb49aea891e628dc5dc1c2338e4f0f35bb8c6e52a681bc8686a951670e` |
+| v0.1.0 | `7e7846a4383c4b159c13ca5188db177b27e5d1f4e0e36c668b8a3e7fcedf70df` |
+
+Compute the digest locally:
+
+```bash
+# macOS / Linux
+sha256sum jadx-headless-mcp-0.7.2-all.jar
+```
+
+```powershell
+# Windows PowerShell
+(Get-FileHash -Algorithm SHA256 jadx-headless-mcp-0.7.2-all.jar).Hash.ToLowerInvariant()
+```
+
+> **Maintainer note:** each new release adds a row here. The same digest ships as the release's `jadx-headless-mcp.sha256` asset and is pinned in [`.mcp.json`](.mcp.json) — keep all three in sync.
+
 ## Acknowledgements
 
 - [`skylot/jadx`](https://github.com/skylot/jadx) — the underlying decompiler
