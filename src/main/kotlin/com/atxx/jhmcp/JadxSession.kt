@@ -6,8 +6,13 @@ import jadx.api.JavaClass
 import jadx.api.JavaField
 import jadx.api.JavaMethod
 import jadx.api.JavaNode
+import jadx.api.JhmcpJadxAccess
 import jadx.api.ResourceFile
 import jadx.api.ResourceType
+import jadx.core.dex.attributes.AFlag
+import jadx.core.dex.nodes.ClassNode
+import jadx.core.dex.nodes.FieldNode
+import jadx.core.dex.nodes.MethodNode
 import jadx.core.xmlgen.ResContainer
 import org.slf4j.LoggerFactory
 import java.io.Closeable
@@ -86,18 +91,18 @@ class JadxSession private constructor(
     val classFqns: List<String> by lazy { classes.map { it.fullName } }
 
     /**
-     * Every class INCLUDING nested/inner ones. jadx's `decompiler.classes` returns only top-level
-     * classes; inner classes (and Kotlin `$Companion`) are reachable solely via `getInnerClasses()`.
-     * Flattening them here is what makes `Outer$Companion` / `Outer.Inner` addressable by name.
+     * Every class INCLUDING nested/inner ones, built without materializing `JavaClass.innerClasses`
+     * (which calls `load()` / decompile in jadx 1.5.x). Uses [JadxDecompiler.getClassesWithInners]
+     * so exact/`$Companion` lookup stays addressable without whole-APK code generation.
      */
     val allClasses: List<JavaClass> by lazy {
-        val out = ArrayList<JavaClass>(classes.size + classes.size / 4)
-        val stack = ArrayDeque(classes)
-        while (stack.isNotEmpty()) {
-            val c = stack.removeLast()
+        val raw = decompiler.classesWithInners
+        val out = ArrayList<JavaClass>(raw.size)
+        for (c in raw) {
+            // Match getClasses() filtering: skip DONT_GENERATE / no-code synthetic shells.
+            if (c.isNoCode) continue
+            if (packageFilter.active && !packageFilter.keep(c.fullName, c.rawName)) continue
             out += c
-            val inners = runCatching { c.innerClasses }.getOrNull()
-            if (!inners.isNullOrEmpty()) stack.addAll(inners)
         }
         out
     }
@@ -128,8 +133,7 @@ class JadxSession private constructor(
     private val methodsByName: Map<String, List<JavaMethod>> by lazy {
         val map = HashMap<String, MutableList<JavaMethod>>(allClasses.size * 4)
         for (cls in allClasses) {
-            val methods = runCatching { cls.methods }.getOrNull() ?: continue
-            for (m in methods) {
+            for (m in metadataMethods(cls)) {
                 map.getOrPut(m.name) { mutableListOf() }.add(m)
             }
         }
@@ -179,7 +183,7 @@ class JadxSession private constructor(
 
     /** Inner classes of [cls] with both dotted and raw (`$`) forms so callers can copy an addressable name. */
     fun innerClasses(cls: JavaClass): List<Map<String, Any>> =
-        cls.innerClasses.map {
+        metadataInnerClasses(cls).map {
             mapOf(
                 "full_name" to it.fullName,
                 "raw_name" to it.rawName,
@@ -244,10 +248,10 @@ class JadxSession private constructor(
             if (SearchScope.CLASS in scopes && cls.fullName.lowercase().contains(kw)) {
                 matched += SearchScope.CLASS
             }
-            if (SearchScope.METHOD in scopes && cls.methods.any { it.name.lowercase().contains(kw) }) {
+            if (SearchScope.METHOD in scopes && classNodeHasMethodName(cls, kw)) {
                 matched += SearchScope.METHOD
             }
-            if (SearchScope.FIELD in scopes && cls.fields.any { it.name.lowercase().contains(kw) }) {
+            if (SearchScope.FIELD in scopes && classNodeHasFieldName(cls, kw)) {
                 matched += SearchScope.FIELD
             }
             // CODE only on top-level classes: jadx inlines inner-class source into the outer class's
@@ -298,18 +302,18 @@ class JadxSession private constructor(
 
     fun findMethod(classFqn: String, methodName: String): JavaMethod? {
         val cls = resolveClass(classFqn) ?: return null
-        return cls.methods.firstOrNull { it.name == methodName }
+        return metadataMethods(cls).firstOrNull { it.name == methodName }
     }
 
     /** All methods matching [methodName] in the class (handles overloads). */
     fun findMethods(classFqn: String, methodName: String): List<JavaMethod> {
         val cls = resolveClass(classFqn) ?: return emptyList()
-        return cls.methods.filter { it.name == methodName }
+        return metadataMethods(cls).filter { it.name == methodName }
     }
 
     fun findField(classFqn: String, fieldName: String): JavaField? {
         val cls = resolveClass(classFqn) ?: return null
-        return cls.fields.firstOrNull { it.name == fieldName }
+        return metadataFields(cls).firstOrNull { it.name == fieldName }
     }
 
     fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
@@ -495,8 +499,8 @@ class JadxSession private constructor(
     }
 
     private fun decompileErrorBanner(cls: JavaClass, kind: String, err: Throwable): String {
-        val methods = runCatching { cls.methods.size }.getOrDefault(-1)
-        val fields = runCatching { cls.fields.size }.getOrDefault(-1)
+        val methods = runCatching { metadataMethodNodes(cls.classNode).size }.getOrDefault(-1)
+        val fields = runCatching { metadataFieldNodes(cls.classNode).size }.getOrDefault(-1)
         return buildString {
             appendLine("// ERROR: jadx $kind failed for ${cls.fullName}")
             appendLine("// reason: ${err.message ?: err.javaClass.simpleName}")
@@ -507,14 +511,14 @@ class JadxSession private constructor(
     }
 
     /**
-     * Class skeleton without method/field bodies.
-     * Note: jadx's `JavaClass.getMethods()`/`getFields()` can force full decompile on some
-     * builds (especially control-flow-obfuscated classes). We still wrap with the hard timeout
-     * so summary cannot hang MCP for hours.
+     * Class skeleton from [ClassNode] metadata only — no `JavaClass.load()` / code generation.
+     * Signatures come from parsed method/field nodes (may include synthetics; `def_pos` stays 0
+     * until a later source request decompiles the class). Overload identity (name + arg types)
+     * matches the [JavaMethod] wrappers used by get_method_by_name / get_method_body.
      */
     fun summarizeClass(cls: JavaClass): Map<String, Any> {
-        val skeleton = decompileTimed(cls.fullName, "summary", decompileTimeoutMs) {
-            val methods = cls.methods.map { m ->
+        return try {
+            val methods = metadataMethods(cls).map { m ->
                 mapOf(
                     "name" to m.name,
                     "signature" to buildString {
@@ -529,25 +533,26 @@ class JadxSession private constructor(
                     "def_pos" to m.defPos,
                 )
             }
-            val fields = cls.fields.map { f ->
+            val fields = metadataFields(cls).map { f ->
                 mapOf(
                     "name" to f.name,
                     "type" to shortType(f.type.toString()),
                     "def_pos" to f.defPos,
                 )
             }
+            val inners = metadataInnerClasses(cls)
             mapOf(
                 "full_name" to cls.fullName,
                 "name" to cls.name,
                 "method_count" to methods.size,
                 "field_count" to fields.size,
-                "inner_class_count" to cls.innerClasses.size,
+                "inner_class_count" to inners.size,
                 "methods" to methods,
                 "fields" to fields,
-                "inner_classes" to cls.innerClasses.map { it.fullName },
+                "inner_classes" to inners.map { it.fullName },
+                "inventory" to "class_node_metadata",
             )
-        }
-        val result = skeleton.getOrElse { err ->
+        } catch (err: Exception) {
             mapOf(
                 "full_name" to cls.fullName,
                 "name" to cls.name,
@@ -557,11 +562,9 @@ class JadxSession private constructor(
                 "methods" to emptyList<Any>(),
                 "fields" to emptyList<Any>(),
                 "inner_classes" to emptyList<Any>(),
-                "hint" to "summary timed out — class likely control-flow obfuscated; try search_method_by_name / DEX strings",
+                "hint" to "metadata summary failed — try search_method_by_name / DEX strings",
             )
         }
-        if (result["error"] == null) rememberDecompiled(cls)
-        return result
     }
 
     /**
@@ -611,6 +614,45 @@ class JadxSession private constructor(
     private fun rememberDecompiled(cls: JavaClass) {
         decompileLru.remember(cls)
     }
+
+    // ── ClassNode metadata (no JavaClass.load / decompile) ───────────────────────
+
+    /**
+     * Methods as [JavaMethod] wrappers built from [ClassNode.getMethods] via
+     * [JadxDecompiler.convertMethodNode] — does not call [JavaClass.getMethods].
+     */
+    fun metadataMethods(cls: JavaClass): List<JavaMethod> {
+        val nodes = metadataMethodNodes(cls.classNode)
+        return nodes.map { JhmcpJadxAccess.wrapMethod(decompiler, it) }
+            .sortedBy { it.name }
+    }
+
+    /** Fields as [JavaField] wrappers from [ClassNode.getFields] without [JavaClass.getFields]. */
+    fun metadataFields(cls: JavaClass): List<JavaField> {
+        val nodes = metadataFieldNodes(cls.classNode)
+        return nodes.map { JhmcpJadxAccess.wrapField(decompiler, it) }
+    }
+
+    /** Inner classes from [ClassNode.getInnerClasses] without [JavaClass.getInnerClasses]. */
+    fun metadataInnerClasses(cls: JavaClass): List<JavaClass> {
+        return cls.classNode.innerClasses
+            .asSequence()
+            .filter { !it.contains(AFlag.DONT_GENERATE) }
+            .map { JhmcpJadxAccess.wrapClass(decompiler, it) }
+            .toList()
+    }
+
+    private fun metadataMethodNodes(node: ClassNode): List<MethodNode> =
+        node.methods.filter { !it.contains(AFlag.DONT_GENERATE) }
+
+    private fun metadataFieldNodes(node: ClassNode): List<FieldNode> =
+        node.fields.filter { !it.contains(AFlag.DONT_GENERATE) }
+
+    private fun classNodeHasMethodName(cls: JavaClass, kwLower: String): Boolean =
+        metadataMethodNodes(cls.classNode).any { it.alias.lowercase().contains(kwLower) }
+
+    private fun classNodeHasFieldName(cls: JavaClass, kwLower: String): Boolean =
+        metadataFieldNodes(cls.classNode).any { it.alias.lowercase().contains(kwLower) }
 
     private fun shortType(s: String): String {
         // Strip leading package on common types to keep summary readable:

@@ -99,7 +99,7 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
 
     addTool(
         name = "get_class_summary",
-        description = "Lightweight class skeleton: method signatures, field names, inner class names — no method bodies. Cheaper than get_class_source for navigation; use it to pick which method to drill into.",
+        description = "Lightweight class skeleton from ClassNode metadata (no decompile / code generation): method signatures, field names, inner class names — no method bodies. Safe for first navigation after resolve_class; use it to pick which method to drill into with get_method_by_name.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string") }
@@ -174,7 +174,9 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 200
         val namesOnly = req.arguments.boolArg("names_only") ?: false
-        val filtered = if (filter == null) cls.fields else cls.fields.filter { it.name.lowercase().contains(filter) }
+        // Metadata-only: JavaClass.fields calls load()/decompile in jadx 1.5.x.
+        val allFields = s.metadataFields(cls)
+        val filtered = if (filter == null) allFields else allFields.filter { it.name.lowercase().contains(filter) }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", cls.fullName)
