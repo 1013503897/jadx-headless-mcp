@@ -308,7 +308,7 @@ private fun runHttp(cfg: Config, buildServer: () -> Server) {
 }
 
 /** Wire up all ~26 MCP tools, grouped by concern into per-topic registration files. */
-private fun registerTools(server: Server, holder: SessionHolder) {
+internal fun registerTools(server: Server, holder: SessionHolder) {
     server.registerSessionTools(holder)
     server.registerManifestTools(holder)
     server.registerClassTools(holder)

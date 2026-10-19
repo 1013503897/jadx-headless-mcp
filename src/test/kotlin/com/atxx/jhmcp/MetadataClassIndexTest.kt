@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import java.util.jar.JarEntry
@@ -124,9 +125,15 @@ class MetadataClassIndexTest {
         val javac = findJavac()
         val cmd = mutableListOf(javac, "-encoding", "UTF-8", "-d", classesDir.absolutePath)
         cmd.addAll(javaFiles.map { it.absolutePath })
-        val proc = ProcessBuilder(cmd)
-            .redirectErrorStream(true)
-            .start()
+        val proc = try {
+            ProcessBuilder(cmd).redirectErrorStream(true).start()
+        } catch (e: IOException) {
+            throw AssertionError(
+                "javac could not be started ($javac) — the fixture needs a JDK " +
+                    "(set JAVA_HOME to a JDK, or put javac on PATH): ${e.message}",
+                e,
+            )
+        }
         val out = proc.inputStream.bufferedReader().readText()
         assertTrue(proc.waitFor(60, TimeUnit.SECONDS), "javac timed out")
         assertEquals(0, proc.exitValue(), "javac failed: $out")
@@ -143,18 +150,24 @@ class MetadataClassIndexTest {
         return jar
     }
 
+    /**
+     * Locate `javac` without relying on a POSIX shell: `<java.home>/bin/javac[.exe]`, then the
+     * JDK-next-to-JRE layout, then a bare program name that the OS resolves from PATH.
+     *
+     * The previous `which javac` fallback broke on Windows — Git Bash answers with an MSYS path
+     * (`/c/Program Files/...`) that CreateProcess cannot execute, so the test failed in
+     * `@BeforeAll` on every Windows host.
+     */
     private fun findJavac(): String {
-        val home = System.getProperty("java.home")
-        val candidates = listOf(
-            File(home, "bin/javac"),
-            File(home, "../bin/javac"), // jre-only java.home
-        )
-        candidates.firstOrNull { it.isFile }?.let { return it.absolutePath }
-        val pathJavac = ProcessBuilder("which", "javac").start()
-            .inputStream.bufferedReader().readText().trim()
-        require(pathJavac.isNotEmpty()) {
-            "javac not found (need a JDK to build the nested-classes fixture)"
+        val exe = if (System.getProperty("os.name").orEmpty().lowercase().contains("win")) {
+            "javac.exe"
+        } else {
+            "javac"
         }
-        return pathJavac
+        val home = File(System.getProperty("java.home"))
+        listOf(File(home, "bin/$exe"), File(home.parentFile, "bin/$exe"))
+            .firstOrNull { it.isFile }
+            ?.let { return it.absolutePath }
+        return exe
     }
 }
