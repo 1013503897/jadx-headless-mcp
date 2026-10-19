@@ -294,6 +294,7 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 
 | 版本 | `jadx-headless-mcp-<version>-all.jar` 的 SHA-256 |
 |---|---|
+| v0.8.0 | `4b9a01c23845c123c217840182d2b5f2c26a7ca20dec3d08810b310fc80a2372` |
 | v0.7.2 | `f4597565f1a3410c03e1da4f5e3a508626fc6a02236452bf09bbf0c20cda2131` |
 | v0.7.1 | `6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75` |
 | v0.7.0 | `18438a640d0c98a5afcb93e4a9f47c1491e38173a8d6841f1615886d5433ec07` |
@@ -308,12 +309,12 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 
 ```bash
 # macOS / Linux
-sha256sum jadx-headless-mcp-0.7.2-all.jar
+sha256sum jadx-headless-mcp-0.8.0-all.jar
 ```
 
 ```powershell
 # Windows PowerShell
-(Get-FileHash -Algorithm SHA256 jadx-headless-mcp-0.7.2-all.jar).Hash.ToLowerInvariant()
+(Get-FileHash -Algorithm SHA256 jadx-headless-mcp-0.8.0-all.jar).Hash.ToLowerInvariant()
 ```
 
 > **维护者注记：** 每次新发布都要在此表补一行。同一摘要会作为该次发布的 `jadx-headless-mcp.sha256` 资产发布，并在 [`.mcp.json`](.mcp.json) 里 pin —— 三处保持一致。
