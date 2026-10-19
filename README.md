@@ -30,7 +30,7 @@ So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio
 | `get_main_application_classes_names` | FQNs of classes under the Manifest `package` — a lightweight "is the right APK loaded" probe |
 | `list_classes` | Paginated class FQN list |
 | `search_classes_by_keyword` | Substring search over class FQNs |
-| `get_class_source` | Decompiled Java source. Auto-falls back to smali when jadx hits anti-decompile stubs (marker `// [jadx java-decompile failed → smali]`; `smali_fallback=false` to opt out). Pageable via `offset` (char offset into full source); header reports `total_bytes`/`next_offset`. Resolves inner/`$Companion` names. |
+| `get_class_source` | Decompiled Java source. Auto-falls back to smali when jadx hits anti-decompile stubs (marker `// [jadx java-decompile failed → smali]`; `smali_fallback=false` to opt out). Pageable via `offset` (UTF-8 byte offset into full source); header reports `total_bytes`/`next_offset`. Resolves inner/`$Companion` names. |
 | `get_class_summary` | Class skeleton (method signatures, fields, inner-class names) — no method bodies |
 | `get_smali_of_class` | Smali disassembly. Pageable via `offset` (byte offset into full smali); header reports `total_bytes`/`next_offset` |
 | `get_methods_of_class` | Method signatures |
@@ -97,7 +97,7 @@ Pass these as `args` alongside `--apk` / `--max-source-bytes` (all optional; `lo
 | `--code-cache-size <n>` | `64` | max decompiled top-level classes kept in RAM (LRU-evicted via `JavaClass.unload()`). `0` = unlimited. |
 | `--resources <full\|lite\|none>` | `full` | `full`: all resource files; `lite`: only Manifest + `values/strings` XML + `resources.arsc`; `none`: hide non-manifest resources (`get_strings` unavailable). |
 | `--max-scan <n>` | tiered | cap on classes scanned by `search_classes_by_keyword` `code` scope (`0` = built-in defaults: 20000 with a package prefix, 5000 without). |
-| `--decompile-timeout-ms <n>` | `90000` | hard wall-clock budget per full-class decompile; prevents one fat obfuscated class from wedging the process. |
+| `--decompile-timeout-ms <n>` | `90000` | hard wall-clock budget per full-class decompile; prevents one fat obfuscated class from wedging the process. Counts a task's own execution time, not time spent queued behind another request; queue wait is bounded separately at `min(this, 30s)`. |
 
 Run `--help` for the full list (including the `--transport http` remote flags below).
 

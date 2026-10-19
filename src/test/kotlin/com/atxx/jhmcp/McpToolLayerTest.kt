@@ -14,6 +14,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
@@ -113,5 +114,29 @@ class McpToolLayerTest {
     fun `unknown class yields an error result, not an exception`() {
         val r = call("get_class_source", buildJsonObject { put("class_name", "demo.DoesNotExist") })
         assertTrue(r.isError == true, "expected isError for a missing class; got ${r.text()}")
+    }
+
+    @Test
+    fun `get_class_source offset paging reassembles the whole class`() {
+        val full = call("get_class_source", buildJsonObject {
+            put("class_name", "demo.Outer"); put("max_bytes", 100_000)
+        }).text()
+        val totalBytes = full.toByteArray(Charsets.UTF_8).size
+        assertTrue(totalBytes > 16, "fixture too small to exercise paging: $totalBytes bytes")
+
+        val reassembled = StringBuilder()
+        var offset = 0
+        var guard = 0
+        while (offset < totalBytes && guard++ < 10_000) {
+            val page = call("get_class_source", buildJsonObject {
+                put("class_name", "demo.Outer"); put("max_bytes", 16); put("offset", offset)
+            }).text()
+            assertTrue(page.startsWith("// [source window]"), "expected a window header, got: ${page.take(60)}")
+            reassembled.append(page.substringAfter("\n\n"))
+            val next = Regex("next_offset=(\\d+)").find(page)?.groupValues?.get(1)?.toInt() ?: break
+            assertTrue(next > offset, "paging must advance (offset=$offset next=$next)")
+            offset = next
+        }
+        assertEquals(full, reassembled.toString(), "paged windows must reassemble the full source")
     }
 }

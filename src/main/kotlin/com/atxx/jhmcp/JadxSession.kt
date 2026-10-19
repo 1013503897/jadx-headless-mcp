@@ -364,20 +364,11 @@ class JadxSession private constructor(
     )
 
     /**
-     * Fetch decompiled Java for a class; if jadx emitted an anti-decompile / decompile-failure
-     * banner (goto stubs, "Code decompiled incorrectly", "Method not decompiled", …), transparently
-     * return the class smali instead — prefixed with a `// [jadx java-decompile failed → smali]`
-     * marker so the caller knows. Set [smaliFallback] = false to force the (partial) Java.
-     */
-    fun getClassSourceSmart(cls: JavaClass, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
-        val full = decompileClassSmartFull(cls, smaliFallback)
-        return full.copy(text = truncateToBytes(full.text, maxBytes))
-    }
-
-    /**
-     * The un-truncated body behind [getClassSourceSmart]: decompile Java, and on a strong
-     * anti-decompile marker transparently swap in the class smali (with the fallback header). No byte
-     * cap applied — callers either truncate ([getClassSourceSmart]) or page ([getClassSourceWindow]).
+     * Decompile Java for a class; if jadx emitted an anti-decompile / decompile-failure banner (goto
+     * stubs, "Code decompiled incorrectly", "Method not decompiled", …), transparently swap in the
+     * class smali instead — prefixed with a `// [jadx java-decompile failed → smali]` marker so the
+     * caller knows. Set [smaliFallback] = false to force the (partial) Java. No byte cap applied;
+     * [getClassSourceWindow] pages the result.
      */
     private fun decompileClassSmartFull(cls: JavaClass, smaliFallback: Boolean): SmartCode {
         val java = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
@@ -395,31 +386,28 @@ class JadxSession private constructor(
         return SmartCode(java, "java", false, markers)
     }
 
-    /** A byte-char window of the smart (Java-or-smali) source for paging a huge class. */
+    /** A UTF-8 byte window of the smart (Java-or-smali) source for paging a huge class. */
     data class SourceWindow(
         val text: String,
-        val total: Int,
-        val next: Int,
+        val totalBytes: Int,
+        val nextOffset: Int,
         val kind: String,
         val fellBack: Boolean,
     )
 
     /**
-     * Slice a window out of [getClassSourceSmart]'s full text (for paging huge classes), mirroring
-     * [getClassSmaliWindow]. [offset]/[limit] are character offsets into the full decompiled text.
+     * Slice a window out of the smart (Java-or-smali) source for paging huge classes, mirroring
+     * [getClassSmaliWindow]. [offset]/[limit] are UTF-8 byte offsets (same unit as `max_bytes`).
      */
     fun getClassSourceWindow(cls: JavaClass, offset: Int, limit: Int, smaliFallback: Boolean = true): SourceWindow {
         val full = decompileClassSmartFull(cls, smaliFallback)
-        val total = full.text.length
-        if (offset >= total) return SourceWindow("", total, total, full.kind, full.fellBack)
-        val from = offset.coerceIn(0, total)
-        val to = (from + limit).coerceAtMost(total)
-        return SourceWindow(full.text.substring(from, to), total, to, full.kind, full.fellBack)
+        val w = byteWindow(full.text, offset, limit)
+        return SourceWindow(w.text, w.totalBytes, w.nextOffset, full.kind, full.fellBack)
     }
 
     /**
      * Java body of a single method, or its smali when the Java body is an anti-decompile stub.
-     * The pinpoint version of [getClassSourceSmart] — only the requested method's smali is returned.
+     * The pinpoint counterpart of [decompileClassSmartFull] — only the requested method's smali is returned.
      */
     fun getMethodBodySmart(method: JavaMethod, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
         val java = getMethodSource(method)
@@ -469,17 +457,14 @@ class JadxSession private constructor(
         return MethodSmali(methodName, blocks, blocks.isNotEmpty())
     }
 
-    /** Slice a byte window out of the class smali (for paging huge classes). */
+    /** Slice a UTF-8 byte window out of the class smali (for paging huge classes). */
     fun getClassSmaliWindow(cls: JavaClass, offset: Int, limit: Int): Triple<String, Int, Int> {
         val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return Triple(decompileErrorBanner(cls, "smali", err), 0, 0) }
         rememberDecompiled(cls)
-        val total = smali.length
-        if (offset >= total) return Triple("", total, total)
-        val from = offset.coerceIn(0, total)
-        val to = (from + limit).coerceAtMost(total)
-        return Triple(smali.substring(from, to), total, to)
+        val w = byteWindow(smali, offset, limit)
+        return Triple(w.text, w.totalBytes, w.nextOffset)
     }
 
     // Smali block slicing (extractMethodBlocks / parseSmaliMethodName) now lives in SmaliSlicing.kt
@@ -511,9 +496,11 @@ class JadxSession private constructor(
             // Pool was retired concurrently (a sibling call timed out and rebuilt it). Transient.
             return Result.failure(re)
         }
-        // Bound the pure-queue wait so a genuinely wedged pool still fails loudly. Predecessors retire
-        // the pool within their own budget, so in practice the queue clears well inside this window.
-        val maxQueueWaitMs = timeoutMs
+        // Bound the pure-queue wait so a genuinely wedged pool still fails loudly, but keep it well
+        // under the execution budget so the worst-case latency is queue-wait + execution rather than
+        // 2×timeout. Predecessors retire the pool within their own budget, so the queue normally
+        // clears far sooner than this cap.
+        val maxQueueWaitMs = timeoutMs.coerceAtMost(30_000L)
         while (true) {
             val started = execStart.get()
             val waitMs = if (started == 0L) {
