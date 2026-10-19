@@ -160,7 +160,7 @@ internal fun methodNotFound(s: JadxSession, fqn: String, method: String): CallTo
             "method not found: $fqn.$method — class did not resolve." +
                 if (r.candidates.isNotEmpty()) " Class candidates: ${r.candidates.take(10).joinToString(", ")}" else ""
         )
-    val names = runCatching { cls.methods.map { it.name }.distinct() }.getOrDefault(emptyList())
+    val names = runCatching { s.metadataMethods(cls).map { it.name }.distinct() }.getOrDefault(emptyList())
     val near = names.filter { it.contains(method, ignoreCase = true) }.take(10)
     return errorResult(buildString {
         append("method not found: ${cls.fullName}.$method")

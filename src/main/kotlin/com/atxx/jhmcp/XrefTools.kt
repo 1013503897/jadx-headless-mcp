@@ -87,7 +87,7 @@ internal fun Server.registerXrefTools(holder: SessionHolder) {
         val resolveLine = req.arguments.boolArg("resolve_line") ?: false
         val (cls, err) = s.resolveClassArg(fqn)
         if (cls == null) return@addTool err!!
-        val f = cls.fields.firstOrNull { it.name == name }
+        val f = s.metadataFields(cls).firstOrNull { it.name == name }
             ?: return@addTool errorResult("field not found: ${cls.fullName}.$name — see get_fields_of_class")
         renderUsage(f.fullName, f.useIn, limit, s, resolveLine)
     }
