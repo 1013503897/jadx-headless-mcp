@@ -502,24 +502,16 @@ class JadxSession private constructor(
         // clears far sooner than this cap.
         val maxQueueWaitMs = timeoutMs.coerceAtMost(30_000L)
         while (true) {
-            val started = execStart.get()
-            val waitMs = if (started == 0L) {
-                (maxQueueWaitMs - (System.currentTimeMillis() - submittedAt)).coerceAtLeast(1L)
-            } else {
-                (timeoutMs - (System.currentTimeMillis() - started)).coerceAtLeast(1L)
-            }
-            try {
-                val value = future.get(waitMs, TimeUnit.MILLISECONDS)
-                val elapsed = System.currentTimeMillis() - (execStart.get().takeIf { it > 0L } ?: submittedAt)
-                if (elapsed > 2_000) System.err.println("[jhmcp] $kind $classFqn took ${elapsed}ms")
-                return Result.success(value)
-            } catch (te: TimeoutException) {
-                val startedNow = execStart.get()
-                // Running but still inside its execution budget → we only hit a queue-wait slice.
-                // Wait out the rest of its budget instead of killing a healthy decompile.
-                if (startedNow != 0L && System.currentTimeMillis() - startedNow < timeoutMs) continue
-                // Either never picked up within the queue allowance (pool wedged) or it overran its
-                // own execution budget → retire the stuck pool and hand later calls a fresh one.
+            val decision = decompileWaitDecision(
+                nowMs = System.currentTimeMillis(),
+                submittedAtMs = submittedAt,
+                execStartMs = execStart.get(),
+                timeoutMs = timeoutMs,
+                maxQueueWaitMs = maxQueueWaitMs,
+            )
+            if (decision is WaitDecision.Retire) {
+                // Either never picked up within the queue allowance (pool wedged) or the task overran
+                // its own execution budget → retire the stuck pool and hand later calls a fresh one.
                 future.cancel(true)
                 synchronized(poolLock) {
                     if (decompilePool === pool) {
@@ -532,6 +524,16 @@ class JadxSession private constructor(
                 System.err.println("[jhmcp] $msg")
                 log.warn(msg)
                 return Result.failure(TimeoutException(msg))
+            }
+            try {
+                val value = future.get((decision as WaitDecision.Wait).budgetMs, TimeUnit.MILLISECONDS)
+                val elapsed = System.currentTimeMillis() - (execStart.get().takeIf { it > 0L } ?: submittedAt)
+                if (elapsed > 2_000) System.err.println("[jhmcp] $kind $classFqn took ${elapsed}ms")
+                return Result.success(value)
+            } catch (te: TimeoutException) {
+                // Budget slice elapsed without completion → loop and re-evaluate the policy. A task
+                // still inside its execution budget keeps waiting; a wedged/overrun one retires above.
+                continue
             } catch (ce: CancellationException) {
                 // Our queued task was drained when a sibling call retired the pool. Transient.
                 return Result.failure(ce)
