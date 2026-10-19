@@ -77,11 +77,12 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
 
     addTool(
         name = "get_class_source",
-        description = "Return decompiled Java source. If jadx hits anti-decompile stubs (goto obfuscation, 'Code decompiled incorrectly' / 'Method not decompiled' banners), it transparently returns the class SMALI instead, prefixed with '// [jadx java-decompile failed → smali]' (disable with smali_fallback=false). Accepts inner/\$Companion names. Truncated at max_bytes AFTER jadx finishes; hard-aborts after decompile_timeout_ms (default 90s). Prefer get_class_summary + get_method_by_name/get_method_body for large classes.",
+        description = "Return decompiled Java source. If jadx hits anti-decompile stubs (goto obfuscation, 'Code decompiled incorrectly' / 'Method not decompiled' banners), it transparently returns the class SMALI instead, prefixed with '// [jadx java-decompile failed → smali]' (disable with smali_fallback=false). Accepts inner/\$Companion names. Truncated at max_bytes AFTER jadx finishes; hard-aborts after decompile_timeout_ms (default 90s). To page a huge class pass offset (UTF-8 byte offset into the full source) with max_bytes as the window size; the response header then reports total_bytes and next_offset. Prefer get_class_summary + get_method_by_name/get_method_body for large classes.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("class_name") { put("type", "string"); put("description", "Fully-qualified class name, e.g. com.example.Foo. Inner/Companion forms (Outer\$Inner, Outer.Companion) are accepted.") }
-                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call truncation AFTER decompile; does not speed up jadx. Prefer smaller fetches via get_method_by_name.") }
+                putJsonObject("max_bytes") { put("type", "integer"); put("description", "Per-call window/truncation size AFTER decompile; does not speed up jadx. Prefer smaller fetches via get_method_by_name.") }
+                putJsonObject("offset") { put("type", "integer"); put("description", "UTF-8 byte offset into the full decompiled source to start from (for paging). Default 0."); put("default", 0) }
                 putJsonObject("smali_fallback") { put("type", "boolean"); put("description", "Auto-fall back to smali when Java decompilation fails (default true). Set false to force the partial Java.") ; put("default", true) }
             },
             required = listOf("class_name")
@@ -93,8 +94,18 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
         if (cls == null) return@addTool err!!
         val cap = req.arguments.intArg("max_bytes") ?: s.maxSourceBytes
         val fallback = req.arguments.boolArg("smali_fallback") ?: true
-        val smart = s.getClassSourceSmart(cls, cap, fallback)
-        textResult(smart.text)
+        val offset = (req.arguments.intArg("offset") ?: 0).coerceAtLeast(0)
+        val window = s.getClassSourceWindow(cls, offset, cap, fallback)
+        if (offset == 0 && window.totalBytes <= cap) {
+            // Whole class fits the window — return it plain (backwards-compatible, no header).
+            textResult(window.text)
+        } else {
+            val lenBytes = window.text.toByteArray(Charsets.UTF_8).size
+            val more = if (window.nextOffset < window.totalBytes) " next_offset=${window.nextOffset}" else " (end)"
+            val header = "// [source window] kind=${window.kind} offset=$offset len=$lenBytes " +
+                "total_bytes=${window.totalBytes}$more (pass offset to continue, or use get_method_by_name)\n\n"
+            textResult(header + window.text)
+        }
     }
 
     addTool(
@@ -138,7 +149,8 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
             // Backwards-compatible path, but annotate paging info when the class overflows the window.
             val (window, total, next) = s.getClassSmaliWindow(cls, 0, cap)
             if (total > cap) {
-                val header = "// [smali window] offset=0 len=${window.length} total_bytes=$total next_offset=$next " +
+                val lenBytes = window.toByteArray(Charsets.UTF_8).size
+                val header = "// [smali window] offset=0 len=$lenBytes total_bytes=$total next_offset=$next " +
                     "(pass offset=$next to continue, or use get_method_smali)\n\n"
                 textResult(header + window)
             } else {
@@ -146,8 +158,9 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
             }
         } else {
             val (window, total, next) = s.getClassSmaliWindow(cls, offset, cap)
+            val lenBytes = window.toByteArray(Charsets.UTF_8).size
             val more = if (next < total) " next_offset=$next" else " (end)"
-            val header = "// [smali window] offset=$offset len=${window.length} total_bytes=$total$more\n\n"
+            val header = "// [smali window] offset=$offset len=$lenBytes total_bytes=$total$more\n\n"
             textResult(header + window)
         }
     }

@@ -27,10 +27,11 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 | `get_app_info` | 包名、版本、minSdk/targetSdk、权限 |
 | `get_android_manifest` | 完整的解码后 AndroidManifest.xml |
 | `get_main_activity_class` | LAUNCHER Activity 的 FQN |
+| `get_main_application_classes_names` | Manifest `package` 下的类 FQN —— 用来轻量确认「是否加载了正确的 APK」 |
 | `list_classes` | 分页的类 FQN 列表 |
 | `search_classes_by_keyword` | 按 FQN 子串搜索类 |
-| `get_class_source` | 反编译的 Java 源码 |
-| `get_smali_of_class` | smali 反汇编 |
+| `get_class_source` | 反编译的 Java 源码。jadx 遇到反编译 stub 时自动回退 smali（标记 `// [jadx java-decompile failed → smali]`；`smali_fallback=false` 可关闭）。可用 `offset`（源码的 UTF-8 字节偏移）分页，响应头报告 `total_bytes`/`next_offset`。 |
+| `get_smali_of_class` | smali 反汇编。可用 `offset`（UTF-8 字节偏移）分页，响应头报告 `total_bytes`/`next_offset` |
 | `get_methods_of_class` | 类的方法签名列表 |
 | `get_method_by_name` | 单个方法的源码 |
 | `get_fields_of_class` | 字段列表（含类型） |
@@ -78,6 +79,22 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 ```
 
 服务器通过 stdio 跑 MCP 协议。日志全部走 stderr。
+
+### 启动选项
+
+与 `--apk` / `--max-source-bytes` 一起作为 `args` 传入（都可选；带 per-APK 语义的可在运行时由 `load_apk` 覆盖）：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--threads <n>` | `min(CPU, 4)` | jadx 预反编译 worker 数（控制峰值内存）。`0` = 用满所有核。 |
+| `--include-packages <list>` | — | 逗号分隔的包名/FQN 前缀白名单（如 `com.gcash,com.mynt`），可重复。被丢弃的类会 unload。 |
+| `--exclude-packages <list>` | — | 逗号分隔的包名前缀黑名单（如 `androidx,kotlin`），可重复。与 include 组合时须「匹配 include 且不匹配 exclude」。 |
+| `--code-cache-size <n>` | `64` | 内存中保留的已反编译顶层类上限（LRU，经 `JavaClass.unload()` 淘汰）。`0` = 不限。 |
+| `--resources <full\|lite\|none>` | `full` | `full`：全部资源文件；`lite`：只保留 Manifest + `values/strings` XML + `resources.arsc`；`none`：隐藏非 Manifest 资源（`get_strings` 不可用）。 |
+| `--max-scan <n>` | 分级 | `search_classes_by_keyword` 的 `code` scope 扫描类数上限（`0` = 内置默认：带包前缀 20000、不带 5000）。 |
+| `--decompile-timeout-ms <n>` | `90000` | 单个整类反编译的硬墙钟预算，防止一个超大混淆类把进程卡死。排队等待另有单独上限（`min(该值, 30s)`），不计入执行预算。 |
+
+跑 `--help` 看完整列表（含下文 `--transport http` 的远程参数）。
 
 ## 作为 Claude Code 插件安装
 
