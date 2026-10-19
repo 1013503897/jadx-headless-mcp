@@ -5,9 +5,9 @@
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/scripts/Launcher.java",
         "${CLAUDE_PLUGIN_DATA}",
-        "0.7.1",
-        "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar",
-        "6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75"
+        "0.7.2",
+        "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.2/jadx-headless-mcp-0.7.2-all.jar",
+        "f4597565f1a3410c03e1da4f5e3a508626fc6a02236452bf09bbf0c20cda2131"
       ]
     }
   }
