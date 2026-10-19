@@ -77,6 +77,16 @@ public class Launcher {
 
         List<String> cmd = new ArrayList<>();
         cmd.add(javaBin);
+        // Mirror the JVM args baked into the bin/ start scripts (build.gradle.kts
+        // applicationDefaultJvmArgs). `java -jar` ignores those, so without this the plugin runs with
+        // the default ~25% heap cap (big APKs OOM) and slf4j banners could leak onto stdout.
+        cmd.add("-Xms128M");
+        cmd.add("-XX:MaxRAMPercentage=60.0");
+        cmd.add("-Dorg.slf4j.simpleLogger.logFile=System.err");
+        cmd.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
+        cmd.add("-Dorg.slf4j.simpleLogger.showDateTime=false");
+        cmd.add("-Dorg.slf4j.simpleLogger.showThreadName=false");
+        cmd.add("-Dorg.slf4j.simpleLogger.levelInBrackets=true");
         cmd.add("-jar");
         cmd.add(jar.toString());
         cmd.addAll(Arrays.asList(serverArgs));

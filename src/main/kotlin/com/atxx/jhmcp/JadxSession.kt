@@ -19,12 +19,14 @@ import java.io.Closeable
 import java.io.File
 import java.util.Collections
 import java.util.concurrent.Callable
+import java.util.concurrent.CancellationException
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipFile
 
 class JadxSession private constructor(
@@ -130,6 +132,20 @@ class JadxSession private constructor(
         map
     }
 
+    /**
+     * canonical simple-name → classes, so [resolveClassDetailed]'s fuzzy tier-2 (bare simple name)
+     * is a map lookup instead of a full `allClasses` canonicalize-and-scan on every miss. Built once
+     * (cost ≈ one old fuzzy query), amortized across all later lookups.
+     */
+    private val classesBySimpleName: Map<String, List<JavaClass>> by lazy {
+        val map = HashMap<String, MutableList<JavaClass>>(allClasses.size)
+        for (cls in allClasses) {
+            val simple = canonicalizeClassName(cls.fullName).substringAfterLast('.')
+            map.getOrPut(simple) { mutableListOf() }.add(cls)
+        }
+        map
+    }
+
     private val methodsByName: Map<String, List<JavaMethod>> by lazy {
         val map = HashMap<String, MutableList<JavaMethod>>(allClasses.size * 4)
         for (cls in allClasses) {
@@ -167,10 +183,9 @@ class JadxSession private constructor(
             .toList()
         if (tier1.size == 1) return ClassResolution(tier1[0], emptyList())
         if (tier1.size > 1) return ClassResolution(null, tier1.map { it.fullName })
-        // Tier 2: bare simple-name match (broad) — only auto-pick when unique.
+        // Tier 2: bare simple-name match (broad) — only auto-pick when unique. Indexed lookup.
         val lastSeg = cq.substringAfterLast('.')
-        val tier2 = allClasses.asSequence()
-            .filter { canonicalizeClassName(it.fullName).substringAfterLast('.') == lastSeg }
+        val tier2 = (classesBySimpleName[lastSeg] ?: emptyList()).asSequence()
             .distinctBy { it.fullName }
             .take(50)
             .toList()
@@ -190,14 +205,6 @@ class JadxSession private constructor(
                 "name" to it.name,
             )
         }
-
-    fun searchClasses(keyword: String, limit: Int): List<JavaClass> {
-        val kw = keyword.lowercase()
-        return classes.asSequence()
-            .filter { it.fullName.lowercase().contains(kw) }
-            .take(limit)
-            .toList()
-    }
 
     enum class SearchScope { CLASS, METHOD, FIELD, CODE }
 
@@ -357,12 +364,13 @@ class JadxSession private constructor(
     )
 
     /**
-     * Fetch decompiled Java for a class; if jadx emitted an anti-decompile / decompile-failure
-     * banner (goto stubs, "Code decompiled incorrectly", "Method not decompiled", …), transparently
-     * return the class smali instead — prefixed with a `// [jadx java-decompile failed → smali]`
-     * marker so the caller knows. Set [smaliFallback] = false to force the (partial) Java.
+     * Decompile Java for a class; if jadx emitted an anti-decompile / decompile-failure banner (goto
+     * stubs, "Code decompiled incorrectly", "Method not decompiled", …), transparently swap in the
+     * class smali instead — prefixed with a `// [jadx java-decompile failed → smali]` marker so the
+     * caller knows. Set [smaliFallback] = false to force the (partial) Java. No byte cap applied;
+     * [getClassSourceWindow] pages the result.
      */
-    fun getClassSourceSmart(cls: JavaClass, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
+    private fun decompileClassSmartFull(cls: JavaClass, smaliFallback: Boolean): SmartCode {
         val java = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "source", err), "java", false, emptyList()) }
@@ -373,14 +381,33 @@ class JadxSession private constructor(
                 cls.smali.orEmpty()
             }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "smali", err), "smali", true, markers) }
             rememberDecompiled(cls)
-            return SmartCode(truncateToBytes(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
+            return SmartCode(smaliFallbackHeader(cls.fullName, markers) + smali, "smali", true, markers)
         }
-        return SmartCode(truncateToBytes(java, maxBytes), "java", false, markers)
+        return SmartCode(java, "java", false, markers)
+    }
+
+    /** A UTF-8 byte window of the smart (Java-or-smali) source for paging a huge class. */
+    data class SourceWindow(
+        val text: String,
+        val totalBytes: Int,
+        val nextOffset: Int,
+        val kind: String,
+        val fellBack: Boolean,
+    )
+
+    /**
+     * Slice a window out of the smart (Java-or-smali) source for paging huge classes, mirroring
+     * [getClassSmaliWindow]. [offset]/[limit] are UTF-8 byte offsets (same unit as `max_bytes`).
+     */
+    fun getClassSourceWindow(cls: JavaClass, offset: Int, limit: Int, smaliFallback: Boolean = true): SourceWindow {
+        val full = decompileClassSmartFull(cls, smaliFallback)
+        val w = byteWindow(full.text, offset, limit)
+        return SourceWindow(w.text, w.totalBytes, w.nextOffset, full.kind, full.fellBack)
     }
 
     /**
      * Java body of a single method, or its smali when the Java body is an anti-decompile stub.
-     * The pinpoint version of [getClassSourceSmart] — only the requested method's smali is returned.
+     * The pinpoint counterpart of [decompileClassSmartFull] — only the requested method's smali is returned.
      */
     fun getMethodBodySmart(method: JavaMethod, maxBytes: Int = maxSourceBytes, smaliFallback: Boolean = true): SmartCode {
         val java = getMethodSource(method)
@@ -430,26 +457,29 @@ class JadxSession private constructor(
         return MethodSmali(methodName, blocks, blocks.isNotEmpty())
     }
 
-    /** Slice a byte window out of the class smali (for paging huge classes). */
+    /** Slice a UTF-8 byte window out of the class smali (for paging huge classes). */
     fun getClassSmaliWindow(cls: JavaClass, offset: Int, limit: Int): Triple<String, Int, Int> {
         val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return Triple(decompileErrorBanner(cls, "smali", err), 0, 0) }
         rememberDecompiled(cls)
-        val total = smali.length
-        if (offset >= total) return Triple("", total, total)
-        val from = offset.coerceIn(0, total)
-        val to = (from + limit).coerceAtMost(total)
-        return Triple(smali.substring(from, to), total, to)
+        val w = byteWindow(smali, offset, limit)
+        return Triple(w.text, w.totalBytes, w.nextOffset)
     }
 
     // Smali block slicing (extractMethodBlocks / parseSmaliMethodName) now lives in SmaliSlicing.kt
     // so it is unit-testable without an APK.
 
     /**
-     * Run [block] on the decompile worker with a wall-clock [timeoutMs] budget.
-     * On timeout the worker thread is interrupted; jadx may still be computing until
-     * it honors interrupt, but the MCP call returns immediately so the server unblocks.
+     * Run [block] on the decompile worker with a wall-clock [timeoutMs] budget that counts only the
+     * task's own EXECUTION time, never the time it spent queued behind another request.
+     *
+     * Why this matters under the HTTP transport (concurrent clients, one shared worker): the naive
+     * `future.get(timeoutMs)` charges queue wait to the timeout, so a request that merely waited its
+     * turn would "time out" and then `shutdownNow()` the pool — interrupting a *sibling's* perfectly
+     * healthy, nearly-finished decompile. Here a queued task is given a bounded queue-wait allowance
+     * and the pool is retired only when a task overruns its own execution budget. Each request already
+     * polices itself, so no request needs to kill another's work on its behalf.
      */
     private fun <T> decompileTimed(
         classFqn: String,
@@ -457,44 +487,65 @@ class JadxSession private constructor(
         timeoutMs: Long,
         block: () -> T,
     ): Result<T> {
-        val started = System.currentTimeMillis()
+        val submittedAt = System.currentTimeMillis()
+        val execStart = AtomicLong(0L) // set by the worker the moment it actually starts running block()
         val pool = decompilePool
         val future = try {
-            pool.submit(Callable { block() })
+            pool.submit(Callable { execStart.set(System.currentTimeMillis()); block() })
         } catch (re: RejectedExecutionException) {
             // Pool was retired concurrently (a sibling call timed out and rebuilt it). Transient.
             return Result.failure(re)
         }
-        return try {
-            val value = future.get(timeoutMs, TimeUnit.MILLISECONDS)
-            val elapsed = System.currentTimeMillis() - started
-            if (elapsed > 2_000) {
-                System.err.println("[jhmcp] $kind $classFqn took ${elapsed}ms")
-            }
-            Result.success(value)
-        } catch (te: TimeoutException) {
-            future.cancel(true)
-            // The worker is still running the (likely uninterruptible) decompile. Retire this pool so
-            // its abandoned daemon worker stops blocking the queue, and hand later calls a fresh one.
-            synchronized(poolLock) {
-                if (decompilePool === pool) {
-                    pool.shutdownNow()
-                    decompilePool = newDecompilePool()
+        // Bound the pure-queue wait so a genuinely wedged pool still fails loudly, but keep it well
+        // under the execution budget so the worst-case latency is queue-wait + execution rather than
+        // 2×timeout. Predecessors retire the pool within their own budget, so the queue normally
+        // clears far sooner than this cap.
+        val maxQueueWaitMs = timeoutMs.coerceAtMost(30_000L)
+        while (true) {
+            val decision = decompileWaitDecision(
+                nowMs = System.currentTimeMillis(),
+                submittedAtMs = submittedAt,
+                execStartMs = execStart.get(),
+                timeoutMs = timeoutMs,
+                maxQueueWaitMs = maxQueueWaitMs,
+            )
+            if (decision is WaitDecision.Retire) {
+                // Either never picked up within the queue allowance (pool wedged) or the task overran
+                // its own execution budget → retire the stuck pool and hand later calls a fresh one.
+                future.cancel(true)
+                synchronized(poolLock) {
+                    if (decompilePool === pool) {
+                        pool.shutdownNow()
+                        decompilePool = newDecompilePool()
+                    }
                 }
+                val msg = "decompile $kind timed out after ${timeoutMs}ms for $classFqn " +
+                    "(max_bytes only truncates AFTER jadx finishes — use get_class_summary / get_method_by_name)"
+                System.err.println("[jhmcp] $msg")
+                log.warn(msg)
+                return Result.failure(TimeoutException(msg))
             }
-            val msg = "decompile $kind timed out after ${timeoutMs}ms for $classFqn " +
-                "(max_bytes only truncates AFTER jadx finishes — use get_class_summary / get_method_by_name)"
-            System.err.println("[jhmcp] $msg")
-            log.warn(msg)
-            Result.failure(TimeoutException(msg))
-        } catch (ee: ExecutionException) {
-            val cause = ee.cause ?: ee
-            System.err.println("[jhmcp] decompile $kind failed for $classFqn: ${cause.message}")
-            Result.failure(cause)
-        } catch (ie: InterruptedException) {
-            Thread.currentThread().interrupt()
-            future.cancel(true)
-            Result.failure(ie)
+            try {
+                val value = future.get((decision as WaitDecision.Wait).budgetMs, TimeUnit.MILLISECONDS)
+                val elapsed = System.currentTimeMillis() - (execStart.get().takeIf { it > 0L } ?: submittedAt)
+                if (elapsed > 2_000) System.err.println("[jhmcp] $kind $classFqn took ${elapsed}ms")
+                return Result.success(value)
+            } catch (te: TimeoutException) {
+                // Budget slice elapsed without completion → loop and re-evaluate the policy. A task
+                // still inside its execution budget keeps waiting; a wedged/overrun one retires above.
+                continue
+            } catch (ce: CancellationException) {
+                // Our queued task was drained when a sibling call retired the pool. Transient.
+                return Result.failure(ce)
+            } catch (ee: ExecutionException) {
+                val cause = ee.cause ?: ee
+                System.err.println("[jhmcp] decompile $kind failed for $classFqn: ${cause.message}")
+                return Result.failure(cause)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                future.cancel(true)
+                return Result.failure(ie)
+            }
         }
     }
 

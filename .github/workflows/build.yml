@@ -29,8 +29,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Run tests
+        run: ./gradlew --no-daemon test
+
       - name: Compile + install distribution
         run: ./gradlew --no-daemon installDist
+
+      - name: Build fat jar (shadowJar)
+        run: ./gradlew --no-daemon shadowJar
 
       - name: Smoke check launcher
         run: ./build/install/jadx-headless-mcp/bin/jadx-headless-mcp --help
