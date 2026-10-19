@@ -286,38 +286,25 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 
 - **[REA](https://github.com/morluto/rea)**（`morluto/rea`）把本项目作为其 Android APK 静态分析的上游分析引擎集成。REA 以**未经修改、按 commit 固定**的 git submodule 方式接入（`third_party/jadx-headless-mcp`，固定在 `v0.7.1` 的 commit `5844800`），**no upstream patches**（该版本无任何上游改动），并以 SHA-256 锁定它实际运行的发布 JAR。佐证见 REA 的 [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md) 与 [`docs/android-analysis.md`](https://github.com/morluto/rea/blob/main/docs/android-analysis.md)；固定的版本 / commit / 摘要记录在 [`src/android/JadxRelease.ts`](https://github.com/morluto/rea/blob/main/src/android/JadxRelease.ts)。
 
-想在自己的项目里按摘要固定这个引擎？下方的发布 JAR 摘要表可用来按同样方式校验下载。
+想在自己的项目里按摘要固定这个引擎？每次发布的 `jadx-headless-mcp.sha256` 资产（以及当前发布在 [`.mcp.json`](.mcp.json) 里的 pin）可用来按同样方式校验下载 —— 见下。
 
 ## 发布校验（SHA-256）
 
-每个 [GitHub Release](../../releases) 都附带可移植 fat jar `jadx-headless-mcp-<version>-all.jar`（外加发行 zip，以及自 v0.7.1 起的 `jadx-headless-mcp.sha256` 资产）。要固定或校验某次下载 —— 就像 Claude Code 插件的 [`.mcp.json`](.mcp.json) 所做的、以及任何按摘要锁定该 JAR 的下游集成方所需的那样 —— 把 fat jar 的 SHA-256 与下表核对：
+每个 [GitHub Release](../../releases) 都附带可移植 fat jar `jadx-headless-mcp-<version>-all.jar`、发行 zip，以及自 v0.7.1 起携带该 fat jar SHA-256 的 `jadx-headless-mcp.sha256` 资产。这个 `.sha256` 资产就是每次发布的权威摘要；当前发布的摘要同时 pin 在 Claude Code 插件的 [`.mcp.json`](.mcp.json) 里。
 
-| 版本 | `jadx-headless-mcp-<version>-all.jar` 的 SHA-256 |
-|---|---|
-| v0.8.0 | `4b9a01c23845c123c217840182d2b5f2c26a7ca20dec3d08810b310fc80a2372` |
-| v0.7.2 | `f4597565f1a3410c03e1da4f5e3a508626fc6a02236452bf09bbf0c20cda2131` |
-| v0.7.1 | `6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75` |
-| v0.7.0 | `18438a640d0c98a5afcb93e4a9f47c1491e38173a8d6841f1615886d5433ec07` |
-| v0.6.0 | `7b8dc9187637266ea665be9537e367918e9b69b6633a755d096604590dbdf3e5` |
-| v0.5.1 | `a649431098b0e1af6ffe349cb3d02ef2273302d122db25091801a4294de3c755` |
-| v0.5.0 | `211201ec93825a59e98b43c9b8fd509aa9d8c97f37e03ed0e3166c4fb71f1694` |
-| v0.4.0 | `1ce76f4bab525a7acd609f0549b1a7a673887ea5a2e74a4fbd1e6bc35e075a97` |
-| v0.3.0 | `433fffdb49aea891e628dc5dc1c2338e4f0f35bb8c6e52a681bc8686a951670e` |
-| v0.1.0 | `7e7846a4383c4b159c13ca5188db177b27e5d1f4e0e36c668b8a3e7fcedf70df` |
-
-本地计算摘要：
+要校验某次下载，把它的摘要与该次发布的 `jadx-headless-mcp.sha256` 资产（或 `.mcp.json` 里的 pin）核对：
 
 ```bash
 # macOS / Linux
-sha256sum jadx-headless-mcp-0.8.0-all.jar
+sha256sum jadx-headless-mcp-<version>-all.jar
 ```
 
 ```powershell
 # Windows PowerShell
-(Get-FileHash -Algorithm SHA256 jadx-headless-mcp-0.8.0-all.jar).Hash.ToLowerInvariant()
+(Get-FileHash -Algorithm SHA256 jadx-headless-mcp-<version>-all.jar).Hash.ToLowerInvariant()
 ```
 
-> **维护者注记：** 每次新发布都要在此表补一行。同一摘要会作为该次发布的 `jadx-headless-mcp.sha256` 资产发布，并在 [`.mcp.json`](.mcp.json) 里 pin —— 三处保持一致。
+> **维护者注记：** 该次发布的 `jadx-headless-mcp.sha256` 资产与 [`.mcp.json`](.mcp.json) 里的 pin 携带同一摘要 —— 发版时保持两者一致即可。
 
 ## 致谢
 
