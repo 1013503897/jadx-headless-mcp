@@ -297,7 +297,7 @@ If those projects ship a new tool worth porting, file an issue here.
 
 ## Used by
 
-- **[REA](https://github.com/morluto/rea)** (`morluto/rea`) integrates this project as an upstream analysis engine for its static Android APK analysis. REA vendors it as an unmodified, commit-pinned git submodule (`third_party/jadx-headless-mcp`, pinned to `v0.7.1` at commit `5844800`) with **no upstream patches**, and identifies the release JAR it runs by SHA-256. Provenance: REA's [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md) and [`docs/android-analysis.md`](https://github.com/morluto/rea/blob/main/docs/android-analysis.md); the pinned version / commit / digest live in [`src/android/JadxRelease.ts`](https://github.com/morluto/rea/blob/main/src/android/JadxRelease.ts).
+- **[REA](https://github.com/morluto/rea)** (`morluto/rea`) integrates this project as an upstream analysis engine for its static Android APK analysis.  [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md) .
 
 Pinning this engine by digest in your own project? Each release's `jadx-headless-mcp.sha256` asset (and the current release's [`.mcp.json`](.mcp.json) pin) lets you verify a download the same way — see below.
 
