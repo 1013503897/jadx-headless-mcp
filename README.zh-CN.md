@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-直接基于 `jadx-core` 构建的 headless MCP 服务器，用于 Android APK 静态分析。无需 JADX GUI、无需 Python 适配器、无需安装插件 —— 单个 JVM 进程通过 stdio 跑 MCP 协议。
+直接基于 `jadx-core` 构建的 headless MCP 服务器，用于 Android APK 静态分析。无需 JADX GUI: 单个 JVM 进程通过 stdio 跑 MCP 协议。
 
 ## 为什么做这个
 
@@ -284,7 +284,7 @@ JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 
 ## 被谁使用
 
-- **[REA](https://github.com/morluto/rea)**（`morluto/rea`）把本项目作为其 Android APK 静态分析的上游分析引擎集成。REA 以**未经修改、按 commit 固定**的 git submodule 方式接入（`third_party/jadx-headless-mcp`，固定在 `v0.7.1` 的 commit `5844800`），**no upstream patches**（该版本无任何上游改动），并以 SHA-256 锁定它实际运行的发布 JAR。佐证见 REA 的 [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md) 与 [`docs/android-analysis.md`](https://github.com/morluto/rea/blob/main/docs/android-analysis.md)；固定的版本 / commit / 摘要记录在 [`src/android/JadxRelease.ts`](https://github.com/morluto/rea/blob/main/src/android/JadxRelease.ts)。
+- **[REA](https://github.com/morluto/rea)**（`morluto/rea`）把本项目作为其 Android APK 静态分析的上游分析引擎集成。见 REA 的 [`third_party/README.md`](https://github.com/morluto/rea/blob/main/third_party/README.md)
 
 想在自己的项目里按摘要固定这个引擎？每次发布的 `jadx-headless-mcp.sha256` 资产（以及当前发布在 [`.mcp.json`](.mcp.json) 里的 pin）可用来按同样方式校验下载 —— 见下。
 
