@@ -1,5 +1,7 @@
 # jadx-headless-mcp
 
+[![Featured on Made with REA](https://madewithrea.com/badges/featured.svg)](https://madewithrea.com/builds/jadx-headless-mcp-headless-mcp-server-for-llm-driven-apk-analysis)
+
 **English** | [简体中文](README.zh-CN.md)
 
 Headless MCP server for Android APK static analysis, built directly on `jadx-core`. No JADX GUI required, no Python adapter, no plugin to install — just one JVM process speaking MCP over stdio.
