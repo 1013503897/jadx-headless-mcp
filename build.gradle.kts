@@ -15,7 +15,7 @@ repositories {
 val jadxVersion = "1.5.6"
 val mcpKotlinSdkVersion = "0.15.0"
 // Must match the Ktor version the MCP SDK is built against (see kotlin-sdk-server .module metadata).
-val ktorVersion = "3.5.1"
+val ktorVersion = "3.6.1"
 val slf4jVersion = "2.0.20"
 val junitVersion = "6.1.3"
 
